@@ -1,0 +1,172 @@
+services:
+
+  # ----------------------------------------------------------
+  # Database
+  # ----------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: ctc-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ----------------------------------------------------------
+  # API Gateway
+  # ----------------------------------------------------------
+  gateway:
+    build:
+      context: ./gateway
+    container_name: ctc-gateway
+    restart: unless-stopped
+    ports:
+      - "8000:80"
+    depends_on:
+      user-service:
+        condition: service_started
+      project-service:
+        condition: service_started
+      application-service:
+        condition: service_started
+      work-review-service:
+        condition: service_started
+      payment-notification-service:
+        condition: service_started
+
+  # ----------------------------------------------------------
+  # Frontend
+  # ----------------------------------------------------------
+  frontend:
+    build:
+      context: ./frontend
+    container_name: ctc-frontend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL}
+    depends_on:
+      - gateway
+
+  # ----------------------------------------------------------
+  # Microservices
+  # ----------------------------------------------------------
+  user-service:
+    build:
+      context: ./services/user-service
+    container_name: ctc-user-service
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    environment:
+      DJANGO_DEBUG: ${DJANGO_DEBUG}
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      POSTGRES_DB: ${USER_DB_NAME}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  project-service:
+    build:
+      context: ./services/project-service
+    container_name: ctc-project-service
+    restart: unless-stopped
+    ports:
+      - "8002:8002"
+    environment:
+      DJANGO_DEBUG: ${DJANGO_DEBUG}
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      POSTGRES_DB: ${PROJECT_DB_NAME}
+      USER_SERVICE_URL: ${USER_SERVICE_URL}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  application-service:
+    build:
+      context: ./services/application-service
+    container_name: ctc-application-service
+    restart: unless-stopped
+    ports:
+      - "8003:8003"
+    environment:
+      DJANGO_DEBUG: ${DJANGO_DEBUG}
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      POSTGRES_DB: ${APPLICATION_DB_NAME}
+      USER_SERVICE_URL: ${USER_SERVICE_URL}
+      PROJECT_SERVICE_URL: ${PROJECT_SERVICE_URL}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  work-review-service:
+    build:
+      context: ./services/work-review-service
+    container_name: ctc-work-review-service
+    restart: unless-stopped
+    ports:
+      - "8004:8004"
+    environment:
+      DJANGO_DEBUG: ${DJANGO_DEBUG}
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      POSTGRES_DB: ${WORK_REVIEW_DB_NAME}
+      USER_SERVICE_URL: ${USER_SERVICE_URL}
+      APPLICATION_SERVICE_URL: ${APPLICATION_SERVICE_URL}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  payment-notification-service:
+    build:
+      context: ./services/payment-notification-service
+    container_name: ctc-payment-notification-service
+    restart: unless-stopped
+    ports:
+      - "8005:8005"
+    environment:
+      DJANGO_DEBUG: ${DJANGO_DEBUG}
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      POSTGRES_DB: ${PAYMENT_DB_NAME}
+      APPLICATION_SERVICE_URL: ${APPLICATION_SERVICE_URL}
+      WORK_REVIEW_SERVICE_URL: ${WORK_REVIEW_SERVICE_URL}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
