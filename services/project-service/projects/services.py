@@ -1,10 +1,18 @@
-
+from datetime import date
 from decimal import Decimal, InvalidOperation
 
 from django.core.exceptions import ValidationError
 from django.db.models import Q
 
 from .models import Project
+
+
+class NotProjectOwner(ValidationError):
+    """Raised when a client tries to act on a project they do not own.
+
+    Subclasses ValidationError so existing callers still work; the views
+    catch it first and return 403.
+    """
 
 
 def create_project(*, client_id, **data):
@@ -17,7 +25,7 @@ def create_project(*, client_id, **data):
 
 def _check_owner(project, client_id):
     if str(project.client_id) != str(client_id):
-        raise ValidationError(
+        raise NotProjectOwner(
             "You cannot modify another client's project."
         )
 
@@ -31,9 +39,7 @@ def update_project(*, project, client_id, **data):
         Project.Status.ARCHIVED,
         Project.Status.COMPLETED,
     ):
-        raise ValidationError(
-            "This project can no longer be edited."
-        )
+        raise ValidationError("This project can no longer be edited.")
 
     allowed_fields = {
         "title",
@@ -58,8 +64,11 @@ def publish_project(*, project, client_id):
     _check_owner(project, client_id)
 
     if project.status != Project.Status.DRAFT:
+        raise ValidationError("Only draft projects can be published.")
+
+    if project.deadline < date.today():
         raise ValidationError(
-            "Only draft projects can be published."
+            "A project with a past deadline cannot be published."
         )
 
     project.status = Project.Status.PUBLISHED
@@ -89,43 +98,42 @@ def close_project(*, project, client_id):
 
 def search_projects(
     *,
+    queryset=None,
     query=None,
     skill=None,
     category=None,
     max_budget=None,
 ):
     """
-    Search published projects by text, skill, category, and budget.
+    Filter projects by text, skill, category and maximum budget.
 
-    Skills are stored in a JSONField. Skill matching is performed in
-    Python to avoid database-specific JSON text lookup behaviour.
+    `queryset` is the set of projects the caller is allowed to see.
+    When omitted, only PUBLISHED projects are searched.
+
+    Skills live in a JSONField, so matching is done in Python and the
+    result is turned back into a queryset via primary keys. This avoids
+    database-specific JSON lookups.
     """
-    projects = Project.objects.filter(
-        status=Project.Status.PUBLISHED
+    projects = (
+        queryset
+        if queryset is not None
+        else Project.objects.filter(status=Project.Status.PUBLISHED)
     )
 
-    if query:
+    if query and query.strip():
         query = query.strip()
-        if query:
-            projects = projects.filter(
-                Q(title__icontains=query)
-                | Q(description__icontains=query)
-            )
+        projects = projects.filter(
+            Q(title__icontains=query) | Q(description__icontains=query)
+        )
 
-    if category:
-        category = category.strip()
-        if category:
-            projects = projects.filter(
-                category__iexact=category
-            )
+    if category and category.strip():
+        projects = projects.filter(category__iexact=category.strip())
 
     if max_budget is not None:
         try:
             max_budget = Decimal(str(max_budget))
         except (InvalidOperation, ValueError, TypeError):
-            raise ValidationError(
-                "Maximum budget must be a valid number."
-            )
+            raise ValidationError("Maximum budget must be a valid number.")
 
         if not max_budget.is_finite() or max_budget < 0:
             raise ValidationError(
@@ -134,18 +142,17 @@ def search_projects(
 
         projects = projects.filter(budget__lte=max_budget)
 
-    if skill:
+    if skill and skill.strip():
         skill = skill.strip().lower()
-        if skill:
-            projects = [
-                project
-                for project in projects
-                if isinstance(project.skills, list)
-                and any(
-                    isinstance(item, str)
-                    and skill in item.lower()
-                    for item in project.skills
-                )
-            ]
+        matching_ids = [
+            project.pk
+            for project in projects
+            if isinstance(project.skills, list)
+            and any(
+                isinstance(item, str) and skill in item.lower()
+                for item in project.skills
+            )
+        ]
+        projects = projects.filter(pk__in=matching_ids)
 
     return projects
