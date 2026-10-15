@@ -22,6 +22,8 @@ class ProjectSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = [
             "id",
+            "client_id",
+            "status",
             "created_at",
             "updated_at",
         ]
@@ -31,6 +33,14 @@ class ProjectSerializer(serializers.ModelSerializer):
         if not value:
             raise serializers.ValidationError(
                 "Project title cannot be empty."
+            )
+        return value
+
+    def validate_description(self, value):
+        value = value.strip()
+        if not value:
+            raise serializers.ValidationError(
+                "Project description cannot be empty."
             )
         return value
 
@@ -56,3 +66,6 @@ class ProjectSerializer(serializers.ModelSerializer):
             )
 
         return [skill.strip() for skill in value]
+
+    def validate_category(self, value):
+        return value.strip()
