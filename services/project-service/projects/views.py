@@ -1,10 +1,6 @@
 
-from decimal import Decimal, InvalidOperation
-
 from django.core.exceptions import ValidationError
-from django.http import JsonResponse
-from rest_framework import generics, status
-from rest_framework.decorators import api_view
+from rest_framework import status
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -18,7 +14,6 @@ def get_client_id(request):
     """Get the client ID from the authenticated user's identity."""
     user = request.user
 
-    # Adapt this to the User Service's authentication integration.
     client_id = getattr(user, "client_id", None)
 
     if not client_id:
@@ -29,8 +24,7 @@ def get_client_id(request):
 
 def is_client(request):
     """Check whether the authenticated user has the client role."""
-    user = request.user
-    role = getattr(user, "role", "")
+    role = getattr(request.user, "role", "")
     return str(role).lower() == "client"
 
 
@@ -48,19 +42,64 @@ class ProjectListCreateView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
+        max_budget = request.query_params.get("max_budget")
+
+        if max_budget is not None:
+            try:
+                from decimal import Decimal, InvalidOperation
+
+                max_budget = Decimal(max_budget)
+
+                if not max_budget.is_finite() or max_budget < 0:
+                    raise InvalidOperation
+            except (InvalidOperation, ValueError):
+                return Response(
+                    {"detail": "max_budget must be a valid non-negative number."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
         projects = services.search_projects(
             query=request.query_params.get("q"),
             skill=request.query_params.get("skill"),
             category=request.query_params.get("category"),
-            max_budget=request.query_params.get("max_budget"),
+            max_budget=max_budget,
         )
 
-        if isinstance(projects, list):
-            data = ProjectSerializer(projects, many=True).data
-        else:
-            data = ProjectSerializer(projects, many=True).data
+        # Students can browse published projects.
+        # Clients can browse published projects and their own projects.
+        role = str(getattr(request.user, "role", "")).lower()
+        client_id = get_client_id(request)
 
-        return Response(data)
+        if role == "client" and client_id:
+            if isinstance(projects, list):
+                projects = [
+                    project for project in projects
+                    if (
+                        project.status == Project.Status.PUBLISHED
+                        or str(project.client_id) == client_id
+                    )
+                ]
+            else:
+                from django.db.models import Q
+
+                projects = projects.filter(
+                    Q(status=Project.Status.PUBLISHED)
+                    | Q(client_id=client_id)
+                )
+
+        elif not getattr(request.user, "is_staff", False):
+            if isinstance(projects, list):
+                projects = [
+                    project for project in projects
+                    if project.status == Project.Status.PUBLISHED
+                ]
+            else:
+                projects = projects.filter(
+                    status=Project.Status.PUBLISHED
+                )
+
+        serializer = ProjectSerializer(projects, many=True)
+        return Response(serializer.data)
 
     def post(self, request):
         if not is_client(request):
@@ -73,6 +112,7 @@ class ProjectListCreateView(APIView):
         serializer.is_valid(raise_exception=True)
 
         client_id = get_client_id(request)
+
         if not client_id:
             return Response(
                 {"detail": "Client identity is unavailable."},
@@ -107,16 +147,24 @@ class ProjectDetailView(APIView):
 
     def get(self, request, project_id):
         project = self.get_object(project_id)
+
         if project is None:
             return Response(
                 {"detail": "Project not found."},
                 status=status.HTTP_404_NOT_FOUND,
             )
 
+        client_id = get_client_id(request)
+        is_owner = (
+            client_id is not None
+            and str(project.client_id) == client_id
+        )
+        is_admin = getattr(request.user, "is_staff", False)
+
         if (
             project.status != Project.Status.PUBLISHED
-            and str(project.client_id) != str(get_client_id(request))
-            and not getattr(request.user, "is_staff", False)
+            and not is_owner
+            and not is_admin
         ):
             return Response(
                 {"detail": "Project not found."},
@@ -127,6 +175,7 @@ class ProjectDetailView(APIView):
 
     def put(self, request, project_id):
         project = self.get_object(project_id)
+
         if project is None:
             return Response(
                 {"detail": "Project not found."},
@@ -159,6 +208,39 @@ class ProjectDetailView(APIView):
             )
 
         return Response(ProjectSerializer(project).data)
+
+    def delete(self, request, project_id):
+        project = self.get_object(project_id)
+
+        if project is None:
+            return Response(
+                {"detail": "Project not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        is_admin = getattr(request.user, "is_staff", False)
+
+        if not is_admin:
+            if not is_client(request):
+                return Response(
+                    {"detail": "Only the project owner or an admin can delete projects."},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+
+            client_id = get_client_id(request)
+
+            if (
+                client_id is None
+                or str(project.client_id) != client_id
+            ):
+                return Response(
+                    {"detail": "You cannot delete another client's project."},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+
+        project.delete()
+
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class PublishProjectView(APIView):
@@ -233,10 +315,14 @@ class ProjectStatusView(APIView):
                 status=status.HTTP_404_NOT_FOUND,
             )
 
-        if (
-            str(project.client_id) != str(get_client_id(request))
-            and not getattr(request.user, "is_staff", False)
-        ):
+        client_id = get_client_id(request)
+        is_owner = (
+            client_id is not None
+            and str(project.client_id) == client_id
+        )
+        is_admin = getattr(request.user, "is_staff", False)
+
+        if not is_owner and not is_admin:
             return Response(
                 {"detail": "You cannot view this project's status."},
                 status=status.HTTP_403_FORBIDDEN,
