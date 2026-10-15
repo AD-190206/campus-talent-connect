@@ -142,6 +142,7 @@ services:
       POSTGRES_DB: ${WORK_REVIEW_DB_NAME}
       USER_SERVICE_URL: ${USER_SERVICE_URL}
       APPLICATION_SERVICE_URL: ${APPLICATION_SERVICE_URL}
+      PAYMENT_SERVICE_URL: ${PAYMENT_SERVICE_URL}
     depends_on:
       postgres:
         condition: service_healthy
