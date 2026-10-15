@@ -1,5 +1,10 @@
 
+from decimal import Decimal, InvalidOperation
+
 from django.core.exceptions import ValidationError
+from django.db.models import Q
+from django.http import Http404
+
 from rest_framework import status
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
@@ -10,125 +15,143 @@ from .serializers import ProjectSerializer
 from . import services
 
 
-def get_client_id(request):
-    """Get the client ID from the authenticated user's identity."""
-    user = request.user
+def get_client_id(user):
+    """Return the client identifier supplied by the authentication layer."""
+    client_id = getattr(user, "client_id", None) or getattr(user, "id", None)
 
-    client_id = getattr(user, "client_id", None)
+    if client_id is None:
+        raise ValidationError(
+            "The authenticated user has no client identifier."
+        )
 
-    if not client_id:
-        client_id = getattr(user, "id", None)
-
-    return str(client_id) if client_id else None
+    return client_id
 
 
-def is_client(request):
-    """Check whether the authenticated user has the client role."""
-    role = getattr(request.user, "role", "")
-    return str(role).lower() == "client"
+def is_client(user):
+    return str(getattr(user, "role", "")).lower() == "client"
+
+
+def is_admin(user):
+    return bool(
+        getattr(user, "is_staff", False)
+        or getattr(user, "is_superuser", False)
+        or str(getattr(user, "role", "")).lower() == "admin"
+    )
+
+
+def error_response(exc):
+    """Convert service and validation errors into API responses."""
+    if isinstance(exc, ValidationError):
+        detail = getattr(exc, "messages", [str(exc)])
+        return Response(
+            {"error": detail},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    return Response(
+        {"error": str(exc)},
+        status=status.HTTP_400_BAD_REQUEST,
+    )
+
+
+def get_project_or_404(project_id):
+    try:
+        return Project.objects.get(pk=project_id)
+    except (Project.DoesNotExist, ValueError):
+        raise Http404("Project not found.")
 
 
 class HealthView(APIView):
     permission_classes = [AllowAny]
 
     def get(self, request):
-        return Response({
-            "service": "project-service",
-            "status": "running",
-        })
+        return Response(
+            {
+                "service": "project-service",
+                "status": "healthy",
+            },
+            status=status.HTTP_200_OK,
+        )
 
 
 class ProjectListCreateView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
+        query = request.query_params.get("query")
+        skill = request.query_params.get("skill")
+        category = request.query_params.get("category")
         max_budget = request.query_params.get("max_budget")
 
-        if max_budget is not None:
-            try:
-                from decimal import Decimal, InvalidOperation
-
-                max_budget = Decimal(max_budget)
-
-                if not max_budget.is_finite() or max_budget < 0:
-                    raise InvalidOperation
-            except (InvalidOperation, ValueError):
-                return Response(
-                    {"detail": "max_budget must be a valid non-negative number."},
-                    status=status.HTTP_400_BAD_REQUEST,
+        try:
+            if any([query, skill, category, max_budget is not None]):
+                projects = services.search_projects(
+                    query=query,
+                    skill=skill,
+                    category=category,
+                    max_budget=max_budget,
                 )
+            else:
+                projects = Project.objects.all()
 
-        projects = services.search_projects(
-            query=request.query_params.get("q"),
-            skill=request.query_params.get("skill"),
-            category=request.query_params.get("category"),
-            max_budget=max_budget,
-        )
+            user = request.user
 
-        # Students can browse published projects.
-        # Clients can browse published projects and their own projects.
-        role = str(getattr(request.user, "role", "")).lower()
-        client_id = get_client_id(request)
+            if is_admin(user):
+                pass
+            elif is_client(user):
+                client_id = get_client_id(user)
 
-        if role == "client" and client_id:
-            if isinstance(projects, list):
-                projects = [
-                    project for project in projects
-                    if (
-                        project.status == Project.Status.PUBLISHED
-                        or str(project.client_id) == client_id
+                if hasattr(projects, "filter"):
+                    projects = projects.filter(
+                        Q(status=Project.Status.PUBLISHED)
+                        | Q(client_id=client_id)
                     )
-                ]
+                else:
+                    projects = [
+                        project
+                        for project in projects
+                        if project.status == Project.Status.PUBLISHED
+                        or str(project.client_id) == str(client_id)
+                    ]
             else:
-                from django.db.models import Q
+                if hasattr(projects, "filter"):
+                    projects = projects.filter(
+                        status=Project.Status.PUBLISHED
+                    )
+                else:
+                    projects = [
+                        project
+                        for project in projects
+                        if project.status == Project.Status.PUBLISHED
+                    ]
 
-                projects = projects.filter(
-                    Q(status=Project.Status.PUBLISHED)
-                    | Q(client_id=client_id)
-                )
+            serializer = ProjectSerializer(projects, many=True)
+            return Response(serializer.data, status=status.HTTP_200_OK)
 
-        elif not getattr(request.user, "is_staff", False):
-            if isinstance(projects, list):
-                projects = [
-                    project for project in projects
-                    if project.status == Project.Status.PUBLISHED
-                ]
-            else:
-                projects = projects.filter(
-                    status=Project.Status.PUBLISHED
-                )
-
-        serializer = ProjectSerializer(projects, many=True)
-        return Response(serializer.data)
+        except (ValidationError, InvalidOperation, ValueError) as exc:
+            return error_response(exc)
 
     def post(self, request):
-        if not is_client(request):
+        if not is_client(request.user):
             return Response(
-                {"detail": "Only clients can create projects."},
+                {"error": "Only clients can create projects."},
                 status=status.HTTP_403_FORBIDDEN,
             )
 
         serializer = ProjectSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-
-        client_id = get_client_id(request)
-
-        if not client_id:
+        if not serializer.is_valid():
             return Response(
-                {"detail": "Client identity is unavailable."},
+                serializer.errors,
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
         try:
             project = services.create_project(
-                client_id=client_id,
+                client_id=get_client_id(request.user),
                 **serializer.validated_data,
             )
-        except ValidationError as exc:
-            return Response(
-                {"detail": exc.messages},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+        except (ValidationError, ValueError) as exc:
+            return error_response(exc)
 
         return Response(
             ProjectSerializer(project).data,
@@ -139,107 +162,75 @@ class ProjectListCreateView(APIView):
 class ProjectDetailView(APIView):
     permission_classes = [IsAuthenticated]
 
-    def get_object(self, project_id):
-        try:
-            return Project.objects.get(pk=project_id)
-        except (Project.DoesNotExist, ValueError):
-            return None
-
     def get(self, request, project_id):
-        project = self.get_object(project_id)
-
-        if project is None:
-            return Response(
-                {"detail": "Project not found."},
-                status=status.HTTP_404_NOT_FOUND,
-            )
-
-        client_id = get_client_id(request)
-        is_owner = (
-            client_id is not None
-            and str(project.client_id) == client_id
-        )
-        is_admin = getattr(request.user, "is_staff", False)
+        project = get_project_or_404(project_id)
 
         if (
             project.status != Project.Status.PUBLISHED
-            and not is_owner
-            and not is_admin
+            and not is_admin(request.user)
+            and str(project.client_id) != str(get_client_id(request.user))
         ):
             return Response(
-                {"detail": "Project not found."},
-                status=status.HTTP_404_NOT_FOUND,
-            )
-
-        return Response(ProjectSerializer(project).data)
-
-    def put(self, request, project_id):
-        project = self.get_object(project_id)
-
-        if project is None:
-            return Response(
-                {"detail": "Project not found."},
-                status=status.HTTP_404_NOT_FOUND,
-            )
-
-        if not is_client(request):
-            return Response(
-                {"detail": "Only clients can edit projects."},
+                {"error": "You do not have permission to view this project."},
                 status=status.HTTP_403_FORBIDDEN,
             )
 
+        return Response(
+            ProjectSerializer(project).data,
+            status=status.HTTP_200_OK,
+        )
+
+    def put(self, request, project_id):
+        if not is_client(request.user):
+            return Response(
+                {"error": "Only clients can edit projects."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        project = get_project_or_404(project_id)
         serializer = ProjectSerializer(
             project,
             data=request.data,
             partial=True,
         )
-        serializer.is_valid(raise_exception=True)
 
-        try:
-            project = services.update_project(
-                project=project,
-                client_id=get_client_id(request),
-                **serializer.validated_data,
-            )
-        except ValidationError as exc:
+        if not serializer.is_valid():
             return Response(
-                {"detail": exc.messages},
+                serializer.errors,
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        return Response(ProjectSerializer(project).data)
+        try:
+            updated_project = services.update_project(
+                project=project,
+                client_id=get_client_id(request.user),
+                **serializer.validated_data,
+            )
+        except ValidationError as exc:
+            return error_response(exc)
+
+        return Response(
+            ProjectSerializer(updated_project).data,
+            status=status.HTTP_200_OK,
+        )
 
     def delete(self, request, project_id):
-        project = self.get_object(project_id)
+        project = get_project_or_404(project_id)
 
-        if project is None:
-            return Response(
-                {"detail": "Project not found."},
-                status=status.HTTP_404_NOT_FOUND,
-            )
-
-        is_admin = getattr(request.user, "is_staff", False)
-
-        if not is_admin:
-            if not is_client(request):
+        if not is_admin(request.user):
+            if not is_client(request.user):
                 return Response(
-                    {"detail": "Only the project owner or an admin can delete projects."},
+                    {"error": "Only the owning client or an admin can delete a project."},
                     status=status.HTTP_403_FORBIDDEN,
                 )
 
-            client_id = get_client_id(request)
-
-            if (
-                client_id is None
-                or str(project.client_id) != client_id
-            ):
+            if str(project.client_id) != str(get_client_id(request.user)):
                 return Response(
-                    {"detail": "You cannot delete another client's project."},
+                    {"error": "You cannot delete another client's project."},
                     status=status.HTTP_403_FORBIDDEN,
                 )
 
         project.delete()
-
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
@@ -247,88 +238,78 @@ class PublishProjectView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request, project_id):
-        if not is_client(request):
+        if not is_client(request.user):
             return Response(
-                {"detail": "Only clients can publish projects."},
+                {"error": "Only clients can publish projects."},
                 status=status.HTTP_403_FORBIDDEN,
             )
 
+        project = get_project_or_404(project_id)
+
         try:
-            project = Project.objects.get(pk=project_id)
             project = services.publish_project(
                 project=project,
-                client_id=get_client_id(request),
+                client_id=get_client_id(request.user),
             )
-        except Project.DoesNotExist:
-            return Response(
-                {"detail": "Project not found."},
-                status=status.HTTP_404_NOT_FOUND,
-            )
-        except (ValidationError, ValueError) as exc:
-            return Response(
-                {"detail": str(exc)},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+        except ValidationError as exc:
+            return error_response(exc)
 
-        return Response(ProjectSerializer(project).data)
+        return Response(
+            ProjectSerializer(project).data,
+            status=status.HTTP_200_OK,
+        )
 
 
 class CloseProjectView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request, project_id):
-        if not is_client(request):
+        if not is_client(request.user):
             return Response(
-                {"detail": "Only clients can close projects."},
+                {"error": "Only clients can close projects."},
                 status=status.HTTP_403_FORBIDDEN,
             )
 
+        project = get_project_or_404(project_id)
+
         try:
-            project = Project.objects.get(pk=project_id)
             project = services.close_project(
                 project=project,
-                client_id=get_client_id(request),
+                client_id=get_client_id(request.user),
             )
-        except Project.DoesNotExist:
-            return Response(
-                {"detail": "Project not found."},
-                status=status.HTTP_404_NOT_FOUND,
-            )
-        except (ValidationError, ValueError) as exc:
-            return Response(
-                {"detail": str(exc)},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+        except ValidationError as exc:
+            return error_response(exc)
 
-        return Response(ProjectSerializer(project).data)
+        return Response(
+            ProjectSerializer(project).data,
+            status=status.HTTP_200_OK,
+        )
 
 
 class ProjectStatusView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request, project_id):
-        try:
-            project = Project.objects.get(pk=project_id)
-        except (Project.DoesNotExist, ValueError):
-            return Response(
-                {"detail": "Project not found."},
-                status=status.HTTP_404_NOT_FOUND,
-            )
+        project = get_project_or_404(project_id)
 
-        client_id = get_client_id(request)
         is_owner = (
-            client_id is not None
-            and str(project.client_id) == client_id
+            is_client(request.user)
+            and str(project.client_id) == str(get_client_id(request.user))
         )
-        is_admin = getattr(request.user, "is_staff", False)
 
-        if not is_owner and not is_admin:
+        if not (is_owner or is_admin(request.user)):
             return Response(
-                {"detail": "You cannot view this project's status."},
+                {"error": "You do not have permission to view this status."},
                 status=status.HTTP_403_FORBIDDEN,
             )
 
-        return Response({
-            "id": str(project.id),
-            "status": project.status,
-        })
+        return Response(
+            {
+                "id": str(project.id),
+                "client_id": str(project.client_id),
+                "title": project.title,
+                "status": project.status,
+                "budget": str(project.budget),
+            },
+            status=status.HTTP_200_OK,
+        )
