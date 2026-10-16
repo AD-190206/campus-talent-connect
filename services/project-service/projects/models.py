@@ -1,6 +1,6 @@
 
 import uuid
-
+from django.core.validators import MinValueValidator
 from django.db import models
 
 
@@ -25,7 +25,11 @@ class Project(models.Model):
     description = models.TextField()
     skills = models.JSONField(default=list, blank=True)
     category = models.CharField(max_length=100, blank=True, db_index=True)
-    budget = models.DecimalField(max_digits=12, decimal_places=2)
+    budget = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        validators=[MinValueValidator(0.01)],
+    )
     deadline = models.DateField()
 
     status = models.CharField(
