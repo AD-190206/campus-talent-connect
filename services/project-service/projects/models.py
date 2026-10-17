@@ -1,5 +1,6 @@
 
 import uuid
+from decimal import Decimal
 from django.core.validators import MinValueValidator
 from django.db import models
 
@@ -28,7 +29,7 @@ class Project(models.Model):
     budget = models.DecimalField(
         max_digits=12,
         decimal_places=2,
-        validators=[MinValueValidator(0.01)],
+        validators=[MinValueValidator("0.01")],
     )
     deadline = models.DateField()
 
