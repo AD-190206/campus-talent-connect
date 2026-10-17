@@ -1,17 +1,48 @@
-from datetime import date
 from decimal import Decimal, InvalidOperation
 
 from django.core.exceptions import ValidationError
 from django.db.models import Q
+from django.utils import timezone
 
 from .models import Project
 
+Status = Project.Status
+
+# Lifecycle rules. The service layer is the only place that changes status.
+#
+# IN_PROGRESS, COMPLETED and ARCHIVED are reserved: the API contract has no
+# endpoint that sets them yet, so nothing in this service moves a project
+# into those statuses in this iteration.
+ALLOWED_TRANSITIONS = {
+    Status.DRAFT: {Status.PUBLISHED, Status.CLOSED},
+    Status.PUBLISHED: {Status.CLOSED},
+    Status.IN_PROGRESS: {Status.CLOSED},
+    Status.COMPLETED: set(),
+    Status.CLOSED: set(),
+    Status.ARCHIVED: set(),
+}
+
+# Statuses in which a client may still edit a project. The budget is the
+# source of truth for payments, so it is frozen once work has started.
+EDITABLE_STATUSES = {Status.DRAFT, Status.PUBLISHED}
+
+# Statuses in which a project may be deleted. Projects that other services
+# may reference (published, in progress, completed) cannot be deleted.
+DELETABLE_STATUSES = {Status.DRAFT, Status.CLOSED, Status.ARCHIVED}
+
 
 class NotProjectOwner(ValidationError):
-    """Raised when a client tries to act on a project they do not own.
+    """Raised when someone acts on a project they do not own.
 
-    Subclasses ValidationError so existing callers still work; the views
-    catch it first and return 403.
+    Subclasses ValidationError so existing callers still work; the API layer
+    turns it into 403 FORBIDDEN.
+    """
+
+
+class InvalidStateTransition(ValidationError):
+    """Raised when the project's current status does not allow an action.
+
+    The API layer turns it into 400 INVALID_STATE_TRANSITION.
     """
 
 
@@ -30,16 +61,19 @@ def _check_owner(project, client_id):
         )
 
 
+def _check_transition(project, target, message):
+    if target not in ALLOWED_TRANSITIONS[project.status]:
+        raise InvalidStateTransition(message)
+
+
 def update_project(*, project, client_id, **data):
     """Update editable fields of a client's own project."""
     _check_owner(project, client_id)
 
-    if project.status in (
-        Project.Status.CLOSED,
-        Project.Status.ARCHIVED,
-        Project.Status.COMPLETED,
-    ):
-        raise ValidationError("This project can no longer be edited.")
+    if project.status not in EDITABLE_STATUSES:
+        raise InvalidStateTransition(
+            "This project can no longer be edited."
+        )
 
     allowed_fields = {
         "title",
@@ -62,38 +96,46 @@ def update_project(*, project, client_id, **data):
 def publish_project(*, project, client_id):
     """Publish a draft project."""
     _check_owner(project, client_id)
+    _check_transition(
+        project, Status.PUBLISHED, "Only draft projects can be published."
+    )
 
-    if project.status != Project.Status.DRAFT:
-        raise ValidationError("Only draft projects can be published.")
-
-    if project.deadline < date.today():
+    if project.deadline < timezone.localdate():
         raise ValidationError(
-            "A project with a past deadline cannot be published."
+            {"deadline": "A project with a past deadline cannot be published."}
         )
 
-    project.status = Project.Status.PUBLISHED
+    project.status = Status.PUBLISHED
     project.full_clean()
     project.save(update_fields=["status", "updated_at"])
     return project
 
 
-def close_project(*, project, client_id):
-    """Close a client's own project."""
-    _check_owner(project, client_id)
+def close_project(*, project, client_id, acting_as_admin=False):
+    """Close a project. Owners and admins may close it."""
+    if not acting_as_admin:
+        _check_owner(project, client_id)
 
-    if project.status in (
-        Project.Status.CLOSED,
-        Project.Status.ARCHIVED,
-        Project.Status.COMPLETED,
-    ):
-        raise ValidationError(
-            "This project cannot be closed in its current status."
-        )
+    _check_transition(
+        project,
+        Status.CLOSED,
+        "This project cannot be closed in its current status.",
+    )
 
-    project.status = Project.Status.CLOSED
+    project.status = Status.CLOSED
     project.full_clean()
     project.save(update_fields=["status", "updated_at"])
     return project
+
+
+def delete_project(*, project):
+    """Delete a project if its status allows it."""
+    if project.status not in DELETABLE_STATUSES:
+        raise InvalidStateTransition(
+            "Projects in this status cannot be deleted."
+        )
+
+    project.delete()
 
 
 def search_projects(
@@ -117,7 +159,7 @@ def search_projects(
     projects = (
         queryset
         if queryset is not None
-        else Project.objects.filter(status=Project.Status.PUBLISHED)
+        else Project.objects.filter(status=Status.PUBLISHED)
     )
 
     if query and query.strip():
@@ -133,11 +175,18 @@ def search_projects(
         try:
             max_budget = Decimal(str(max_budget))
         except (InvalidOperation, ValueError, TypeError):
-            raise ValidationError("Maximum budget must be a valid number.")
+            raise ValidationError(
+                {"max_budget": "Maximum budget must be a valid number."}
+            )
 
         if not max_budget.is_finite() or max_budget < 0:
             raise ValidationError(
-                "Maximum budget must be a finite, non-negative number."
+                {
+                    "max_budget": (
+                        "Maximum budget must be a finite, "
+                        "non-negative number."
+                    )
+                }
             )
 
         projects = projects.filter(budget__lte=max_budget)
