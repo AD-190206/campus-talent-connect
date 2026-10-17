@@ -444,6 +444,50 @@ class ReviewEndpointTests(APITestCase):
         self.assertEqual(review.reviewer_id, self.reviewer_id)
         self.assertEqual(review.reviewer_role, "STUDENT")
 
+    def test_duplicate_review_database_conflict_returns_validation_error(self):
+        from unittest.mock import patch
+        from django.db import IntegrityError
+        from rest_framework import status
+        from rest_framework.test import APIRequestFactory, force_authenticate
+        from work_review.views import ReviewListCreateView
+
+        with patch(
+            "work_review.views.ReviewSerializer.save",
+            side_effect=IntegrityError(
+                "unique_review_per_assignment_reviewer"
+            ),
+        ):
+            factory = APIRequestFactory()
+            request = factory.post(
+                "/api/reviews/",
+                {
+                    "assignment_id": str(self.assignment_id),
+                    "reviewee_id": str(self.reviewee_id),
+                    "rating": 5,
+                    "comment": "Good work.",
+                },
+                format="json",
+            )
+
+            user = type(
+                "TestUser",
+                (),
+                {
+                    "user_id": self.reviewer_id,
+                    "role": "STUDENT",
+                    "is_authenticated": True,
+                },
+            )()
+            force_authenticate(request, user=user)
+
+            response = ReviewListCreateView.as_view()(request)
+
+            self.assertEqual(
+                response.status_code,
+                status.HTTP_400_BAD_REQUEST,
+            )
+            self.assertIn("assignment_id", response.data)
+
 
 class SubmitWorkEndpointTests(APITestCase):
     def setUp(self):
@@ -887,7 +931,11 @@ class WorkDetailEndpointTests(APITestCase):
 
         request = self.factory.put(
             f"/api/work/{self.work.id}/",
-            {"title": "Changed title"},
+            {
+                "title": "Changed title",
+                "assignment_id": str(self.work.assignment_id),
+                "project_id": str(self.work.project_id),
+            },
             format="json",
         )
 
@@ -941,3 +989,39 @@ class WorkDetailEndpointTests(APITestCase):
             response.status_code,
             status.HTTP_404_NOT_FOUND,
         )
+
+    def test_assignment_id_cannot_change_after_creation(self):
+        from rest_framework.exceptions import ValidationError
+        from work_review.serializers import DeliverableSerializer
+
+        self.work.status = Deliverable.Status.DRAFT
+        self.work.save(update_fields=["status"])
+
+        serializer = DeliverableSerializer(
+            instance=self.work,
+            data={"assignment_id": str(uuid.uuid4())},
+            partial=True,
+        )
+
+        with self.assertRaises(ValidationError) as context:
+            serializer.is_valid(raise_exception=True)
+
+        self.assertIn("assignment_id", context.exception.detail)
+
+    def test_project_id_cannot_change_after_creation(self):
+        from rest_framework.exceptions import ValidationError
+        from work_review.serializers import DeliverableSerializer
+
+        self.work.status = Deliverable.Status.DRAFT
+        self.work.save(update_fields=["status"])
+
+        serializer = DeliverableSerializer(
+            instance=self.work,
+            data={"project_id": str(uuid.uuid4())},
+            partial=True,
+        )
+
+        with self.assertRaises(ValidationError) as context:
+            serializer.is_valid(raise_exception=True)
+
+        self.assertIn("project_id", context.exception.detail)

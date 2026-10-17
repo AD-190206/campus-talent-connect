@@ -1,7 +1,7 @@
 ﻿from django.utils import timezone
-from django.db import models
+from django.db import IntegrityError, models, transaction
 from rest_framework import generics, status
-from rest_framework.exceptions import PermissionDenied
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -199,10 +199,39 @@ class ReviewListCreateView(generics.ListCreateAPIView):
                 "Only students and clients can create reviews."
             )
 
-        serializer.save(
-            reviewer_id=user.user_id,
-            reviewer_role=user.role,
-        )
+        try:
+            with transaction.atomic():
+                serializer.save(
+                    reviewer_id=user.user_id,
+                    reviewer_role=user.role,
+                )
+        except IntegrityError as exc:
+            cause = exc.__cause__
+            details = str(cause or exc)
+            constraint_name = getattr(
+                getattr(cause, "diag", None),
+                "constraint_name",
+                None,
+            )
+
+            is_duplicate_review = (
+                constraint_name == "unique_review_per_assignment_reviewer"
+                or "unique_review_per_assignment_reviewer" in details
+                or (
+                    "work_review_review.assignment_id" in details
+                    and "work_review_review.reviewer_id" in details
+                )
+            )
+
+            if not is_duplicate_review:
+                raise
+
+            raise ValidationError({
+                "assignment_id": (
+                    "You have already submitted a review "
+                    "for this assignment."
+                )
+            }) from exc
 
 
 class ReviewDetailView(generics.RetrieveAPIView):

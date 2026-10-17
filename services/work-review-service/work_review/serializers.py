@@ -1,7 +1,5 @@
 ﻿from rest_framework import serializers
-
 from .models import Deliverable, Review
-
 
 class DeliverableSerializer(serializers.ModelSerializer):
     class Meta:
@@ -24,9 +22,7 @@ class DeliverableSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = [
             "id",
-            "assignment_id",
             "student_id",
-            "project_id",
             "status",
             "feedback",
             "submitted_at",
@@ -40,6 +36,27 @@ class DeliverableSerializer(serializers.ModelSerializer):
         instance = self.instance
 
         if instance is not None:
+            # Assignment and project identifiers are fixed at creation.
+            if (
+                "assignment_id" in attrs
+                and attrs["assignment_id"] != instance.assignment_id
+            ):
+                raise serializers.ValidationError({
+                    "assignment_id": (
+                        "Assignment ID cannot be changed after creation."
+                    )
+                })
+
+            if (
+                "project_id" in attrs
+                and attrs["project_id"] != instance.project_id
+            ):
+                raise serializers.ValidationError({
+                    "project_id": (
+                        "Project ID cannot be changed after creation."
+                    )
+                })
+
             if instance.status not in {
                 Deliverable.Status.DRAFT,
                 Deliverable.Status.REVISION_REQUESTED,
@@ -50,7 +67,6 @@ class DeliverableSerializer(serializers.ModelSerializer):
                 )
 
         return attrs
-
 
 class ReviewSerializer(serializers.ModelSerializer):
     class Meta:
