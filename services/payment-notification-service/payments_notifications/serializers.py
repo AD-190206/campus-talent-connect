@@ -4,11 +4,11 @@ from .models import Payment, Notification
 
 
 class PaymentCreateSerializer(serializers.ModelSerializer):
+
     class Meta:
         model = Payment
         fields = [
             "assignment_id",
-            "payer_id",
             "payee_id",
             "amount",
             "idempotency_key",
@@ -27,13 +27,6 @@ class PaymentCreateSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(
                 "Amount must be greater than zero.")
         return value
-
-    def validate(self, attrs):
-        if attrs["payer_id"] == attrs["payee_id"]:
-            raise serializers.ValidationError(
-                "Payer and payee must be different users."
-            )
-        return attrs
 
 
 class PaymentSerializer(serializers.ModelSerializer):

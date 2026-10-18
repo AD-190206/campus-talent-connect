@@ -1,8 +1,10 @@
-from .services import PaymentServiceError, create_payment, process_payment, release_payment
+import logging
 from uuid import UUID
-from rest_framework.permissions import AllowAny
+from decimal import Decimal
+from django.core.paginator import EmptyPage, Paginator
 from django.shortcuts import get_object_or_404
 from rest_framework import status
+from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -19,11 +21,22 @@ from .services import (
     process_payment,
     release_payment,
 )
+from .integrations import (
+    UpstreamServiceError,
+    get_assignment,
+    get_project,
+)
+
+logger = logging.getLogger(__name__)
 
 
-def error_response(message, code, http_status):
+def error_response(message, code, http_status, details=None):
     return Response(
-        {"error": message, "code": code},
+        {
+            "error": message,
+            "code": code,
+            "details": details if details is not None else {},
+        },
         status=http_status,
     )
 
@@ -39,40 +52,187 @@ class HealthView(APIView):
 
 
 class PaymentListCreateView(APIView):
-    def get(self, request):
-        queryset = Payment.objects.all()
 
-        user_id = request.query_params.get("user_id")
-        if user_id:
-            try:
-                UUID(user_id)
-            except ValueError:
-                return error_response(
-                    "user_id must be a valid UUID",
-                    "INVALID_USER_ID",
-                    status.HTTP_400_BAD_REQUEST,
-                )
-            queryset = queryset.filter(
-                payer_id=user_id
-            ) | queryset.filter(payee_id=user_id)
+    def get(self, request):
+        user_id = getattr(request.user, "id", None)
+
+        if not user_id:
+            return error_response(
+                "Authenticated user could not be identified.",
+                "AUTHENTICATED_USER_NOT_FOUND",
+                status.HTTP_401_UNAUTHORIZED,
+            )
+
+        queryset = (
+            Payment.objects.filter(payer_id=user_id)
+            | Payment.objects.filter(payee_id=user_id)
+        )
+        queryset = queryset.distinct().order_by("-created_at", "-id")
+
+        try:
+            page = int(request.query_params.get("page", "1"))
+            page_size = int(request.query_params.get("page_size", "20"))
+        except (TypeError, ValueError):
+            return error_response(
+                "page and page_size must be integers.",
+                "INVALID_PAGINATION",
+                status.HTTP_400_BAD_REQUEST,
+            )
+
+        if page < 1 or page_size < 1 or page_size > 100:
+            return error_response(
+                "page must be at least 1 and page_size must be between 1 and 100.",
+                "INVALID_PAGINATION",
+                status.HTTP_400_BAD_REQUEST,
+            )
+
+        paginator = Paginator(queryset, page_size)
+
+        try:
+            page_obj = paginator.page(page)
+        except EmptyPage:
+            return error_response(
+                "Requested page does not exist.",
+                "PAGE_NOT_FOUND",
+                status.HTTP_404_NOT_FOUND,
+            )
 
         return Response({
-            "data": PaymentSerializer(queryset.distinct(), many=True).data,
+            "data": PaymentSerializer(page_obj.object_list, many=True).data,
+            "pagination": {
+                "page": page,
+                "page_size": page_size,
+                "total": paginator.count,
+                "total_pages": paginator.num_pages,
+            },
             "message": "Payment history retrieved successfully",
         })
 
     def post(self, request):
-        serializer = PaymentCreateSerializer(data=request.data)
-        if not serializer.is_valid():
+        user_id = getattr(request.user, "id", None)
+
+        if not user_id:
             return error_response(
-                serializer.errors,
-                "VALIDATION_ERROR",
-                status.HTTP_400_BAD_REQUEST,
+                "Authenticated user could not be identified.",
+                "AUTHENTICATED_USER_NOT_FOUND",
+                status.HTTP_401_UNAUTHORIZED,
             )
 
-        try:
-            payment, created = create_payment(serializer.validated_data)
+        serializer = PaymentCreateSerializer(data=request.data)
 
+        if not serializer.is_valid():
+            return error_response(
+                "Request validation failed.",
+                "VALIDATION_ERROR",
+                status.HTTP_400_BAD_REQUEST,
+                details=serializer.errors,
+            )
+        supplied_payer_id = request.data.get("payer_id")
+
+        if supplied_payer_id is not None and str(supplied_payer_id) != str(user_id):
+            return error_response(
+                "Payer ID must match the authenticated user.",
+                "PAYER_ID_MISMATCH",
+                status.HTTP_403_FORBIDDEN,
+            )
+
+        payment_data = dict(serializer.validated_data)
+        payment_data["payer_id"] = UUID(str(user_id))
+
+        if str(payment_data["payer_id"]) == str(payment_data["payee_id"]):
+            return error_response(
+                "Payer and payee must be different users.",
+                "VALIDATION_ERROR",
+                status.HTTP_400_BAD_REQUEST,
+                details={
+                    "payee_id": [
+                        "Payer and payee must be different users."
+                    ]
+                },
+            )
+
+        authorization = request.headers.get("Authorization")
+
+        try:
+            assignment = get_assignment(
+                payment_data["assignment_id"],
+                authorization,
+            )
+
+            if not isinstance(assignment, dict):
+                return error_response(
+                    "Assignment service returned invalid data.",
+                    "UPSTREAM_INVALID_RESPONSE",
+                    status.HTTP_502_BAD_GATEWAY,
+                )
+
+            project_id = assignment.get("project_id")
+            student_id = assignment.get("student_id")
+
+            if not project_id or not student_id:
+                return error_response(
+                    "Assignment response is missing required fields.",
+                    "UPSTREAM_INVALID_RESPONSE",
+                    status.HTTP_502_BAD_GATEWAY,
+                )
+
+            if str(student_id) != str(payment_data["payee_id"]):
+                return error_response(
+                    "Payee must be the student assigned to this assignment.",
+                    "PAYEE_ASSIGNMENT_MISMATCH",
+                    status.HTTP_400_BAD_REQUEST,
+                )
+
+            project = get_project(project_id, authorization)
+
+            if not isinstance(project, dict):
+                return error_response(
+                    "Project service returned invalid data.",
+                    "UPSTREAM_INVALID_RESPONSE",
+                    status.HTTP_502_BAD_GATEWAY,
+                )
+
+            client_id = project.get("client_id")
+            budget = project.get("budget")
+
+            if not client_id or budget is None:
+                return error_response(
+                    "Project response is missing required fields.",
+                    "UPSTREAM_INVALID_RESPONSE",
+                    status.HTTP_502_BAD_GATEWAY,
+                )
+
+            if str(client_id) != str(payment_data["payer_id"]):
+                return error_response(
+                    "Only the project's client can initiate this payment.",
+                    "PAYER_PROJECT_MISMATCH",
+                    status.HTTP_403_FORBIDDEN,
+                )
+
+            try:
+                project_budget = Decimal(str(budget))
+            except Exception:
+                return error_response(
+                    "Project service returned an invalid budget.",
+                    "UPSTREAM_INVALID_RESPONSE",
+                    status.HTTP_502_BAD_GATEWAY,
+                )
+
+            if payment_data["amount"] > project_budget:
+                return error_response(
+                    "Payment amount cannot exceed the project budget.",
+                    "PAYMENT_EXCEEDS_PROJECT_BUDGET",
+                    status.HTTP_400_BAD_REQUEST,
+                )
+
+        except UpstreamServiceError as exc:
+            return error_response(
+                str(exc),
+                exc.code,
+                exc.http_status,
+            )
+        try:
+            payment, created = create_payment(payment_data)
         except PaymentServiceError as exc:
             return error_response(
                 str(exc),
@@ -80,29 +240,45 @@ class PaymentListCreateView(APIView):
                 status.HTTP_409_CONFLICT,
             )
 
-        except Exception:
-            return error_response(
-                "Could not create payment. Check the request and try again.",
-                "PAYMENT_CREATION_FAILED",
-                status.HTTP_400_BAD_REQUEST,
-            )
-
         response_status = (
-            status.HTTP_201_CREATED if created else status.HTTP_200_OK
+            status.HTTP_201_CREATED
+            if created
+            else status.HTTP_200_OK
         )
-        return Response({
-            "data": PaymentSerializer(payment).data,
-            "message": (
-                "Payment created successfully"
-                if created
-                else "Existing payment returned for this idempotency key"
-            ),
-        }, status=response_status)
+
+        return Response(
+            {
+                "data": PaymentSerializer(payment).data,
+                "message": (
+                    "Payment created successfully"
+                    if created
+                    else "Existing payment returned successfully"
+                ),
+            },
+            status=response_status,
+        )
 
 
 class PaymentDetailView(APIView):
     def get(self, request, payment_id):
-        payment = get_object_or_404(Payment, id=payment_id)
+        user_id = getattr(request.user, "id", None)
+
+        if not user_id:
+            return error_response(
+                "Authenticated user could not be identified.",
+                "AUTHENTICATED_USER_NOT_FOUND",
+                status.HTTP_401_UNAUTHORIZED,
+            )
+
+        payment = get_object_or_404(
+            Payment.objects.filter(
+                payer_id=user_id
+            ) | Payment.objects.filter(
+                payee_id=user_id
+            ),
+            id=payment_id,
+        )
+
         return Response({
             "data": PaymentSerializer(payment).data,
             "message": "Payment retrieved successfully",
@@ -111,20 +287,42 @@ class PaymentDetailView(APIView):
 
 class ProcessPaymentView(APIView):
     def post(self, request, payment_id):
-        payment = get_object_or_404(Payment, id=payment_id)
+        user_id = getattr(request.user, "id", None)
+
+        if not user_id:
+            return error_response(
+                "Authentication is required.",
+                "AUTHENTICATION_REQUIRED",
+                status.HTTP_401_UNAUTHORIZED,
+            )
+
+        # Only the payment's payer can process it.
+        payment = get_object_or_404(
+            Payment.objects.filter(payer_id=user_id),
+            id=payment_id,
+        )
 
         simulate_failure = request.data.get("simulate_failure", False)
+
         if not isinstance(simulate_failure, bool):
             return error_response(
-                "simulate_failure must be true or false",
+                "simulate_failure must be a boolean.",
                 "INVALID_SIMULATION_OPTION",
                 status.HTTP_400_BAD_REQUEST,
             )
 
-        payment = process_payment(
-            payment,
-            simulate_failure=simulate_failure,
-        )
+        try:
+            payment = process_payment(
+                payment,
+                simulate_failure=simulate_failure,
+            )
+        except PaymentServiceError:
+            return error_response(
+                "Payment processing failed.",
+                "PAYMENT_PROCESSING_FAILED",
+                status.HTTP_409_CONFLICT,
+            )
+
         return Response({
             "data": PaymentSerializer(payment).data,
             "message": "Mock payment processing completed",
@@ -133,15 +331,28 @@ class ProcessPaymentView(APIView):
 
 class ReleasePaymentView(APIView):
     def post(self, request, payment_id):
-        payment = get_object_or_404(Payment, id=payment_id)
+        user_id = getattr(request.user, "id", None)
+
+        if not user_id:
+            return error_response(
+                "Authentication is required.",
+                "AUTHENTICATION_REQUIRED",
+                status.HTTP_401_UNAUTHORIZED,
+            )
+
+        # Only the payment's payer can request release.
+        payment = get_object_or_404(
+            Payment.objects.filter(payer_id=user_id),
+            id=payment_id,
+        )
 
         try:
             payment = release_payment(payment)
-        except PaymentServiceError as exc:
+        except PaymentServiceError:
             return error_response(
-                str(exc),
+                "Payment release is not allowed.",
                 "PAYMENT_RELEASE_NOT_ALLOWED",
-                status.HTTP_400_BAD_REQUEST,
+                status.HTTP_409_CONFLICT,
             )
 
         return Response({
@@ -151,20 +362,18 @@ class ReleasePaymentView(APIView):
 
 
 class NotificationListCreateView(APIView):
-    def get(self, request):
-        queryset = Notification.objects.all()
 
-        user_id = request.query_params.get("user_id")
-        if user_id:
-            try:
-                UUID(user_id)
-            except ValueError:
-                return error_response(
-                    "user_id must be a valid UUID",
-                    "INVALID_USER_ID",
-                    status.HTTP_400_BAD_REQUEST,
-                )
-            queryset = queryset.filter(user_id=user_id)
+    def get(self, request):
+        user_id = getattr(request.user, "id", None)
+
+        if not user_id:
+            return error_response(
+                "Authenticated user could not be identified.",
+                "AUTHENTICATED_USER_NOT_FOUND",
+                status.HTTP_401_UNAUTHORIZED,
+            )
+
+        queryset = Notification.objects.filter(user_id=user_id)
 
         unread = request.query_params.get("unread")
         if unread == "true":
@@ -172,21 +381,79 @@ class NotificationListCreateView(APIView):
         elif unread == "false":
             queryset = queryset.filter(is_read=True)
 
+        try:
+            page = int(request.query_params.get("page", "1"))
+            page_size = int(request.query_params.get("page_size", "20"))
+        except (TypeError, ValueError):
+            return error_response(
+                "page and page_size must be integers.",
+                "INVALID_PAGINATION",
+                status.HTTP_400_BAD_REQUEST,
+            )
+
+        if page < 1 or page_size < 1 or page_size > 100:
+            return error_response(
+                "page must be at least 1 and page_size must be between 1 and 100.",
+                "INVALID_PAGINATION",
+                status.HTTP_400_BAD_REQUEST,
+            )
+
+        paginator = Paginator(queryset, page_size)
+
+        try:
+            page_obj = paginator.page(page)
+        except EmptyPage:
+            return error_response(
+                "Requested page does not exist.",
+                "PAGE_NOT_FOUND",
+                status.HTTP_404_NOT_FOUND,
+            )
+
         return Response({
-            "data": NotificationSerializer(queryset, many=True).data,
+            "data": NotificationSerializer(
+                page_obj.object_list,
+                many=True,
+            ).data,
+            "pagination": {
+                "page": page,
+                "page_size": page_size,
+                "total": paginator.count,
+                "total_pages": paginator.num_pages,
+            },
             "message": "Notifications retrieved successfully",
         })
 
     def post(self, request):
+        authenticated_user_id = getattr(request.user, "id", None)
+
+        if not authenticated_user_id:
+            return error_response(
+                "Authenticated user could not be identified.",
+                "AUTHENTICATED_USER_NOT_FOUND",
+                status.HTTP_401_UNAUTHORIZED,
+            )
+
         serializer = NotificationCreateSerializer(data=request.data)
+
         if not serializer.is_valid():
             return error_response(
-                serializer.errors,
+                "Request validation failed.",
                 "VALIDATION_ERROR",
                 status.HTTP_400_BAD_REQUEST,
+                details=serializer.errors,
+            )
+
+        target_user_id = serializer.validated_data["user_id"]
+
+        if str(target_user_id) != str(authenticated_user_id):
+            return error_response(
+                "You can only create notifications for your own account.",
+                "NOTIFICATION_USER_MISMATCH",
+                status.HTTP_403_FORBIDDEN,
             )
 
         notification = serializer.save()
+
         return Response({
             "data": NotificationSerializer(notification).data,
             "message": "Notification created successfully",

@@ -82,3 +82,32 @@ REST_FRAMEWORK = {
         "rest_framework.permissions.IsAuthenticated",
     ],
 }
+# Upstream service configuration
+PROJECT_SERVICE_URL = os.getenv(
+    "PROJECT_SERVICE_URL",
+    "http://project-service:8002",
+).rstrip("/")
+
+APPLICATION_SERVICE_URL = os.getenv(
+    "APPLICATION_SERVICE_URL",
+    "http://application-service:8003",
+).rstrip("/")
+
+WORK_REVIEW_SERVICE_URL = os.getenv(
+    "WORK_REVIEW_SERVICE_URL",
+    "http://work-review-service:8004",
+).rstrip("/")
+
+# Timeout values for upstream HTTP requests, in seconds
+UPSTREAM_CONNECT_TIMEOUT = float(
+    os.getenv("UPSTREAM_CONNECT_TIMEOUT", "3")
+)
+UPSTREAM_READ_TIMEOUT = float(
+    os.getenv("UPSTREAM_READ_TIMEOUT", "5")
+)
+
+# Mock payment processing must be explicitly enabled.
+# Keep it disabled by default.
+MOCK_PAYMENT_ENABLED = os.getenv(
+    "MOCK_PAYMENT_ENABLED", "0"
+) == "1"

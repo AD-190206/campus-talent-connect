@@ -1,7 +1,7 @@
-
 import uuid
 from decimal import Decimal
 
+from django.conf import settings
 from django.db import IntegrityError, transaction
 
 from .models import Payment, Notification
@@ -67,6 +67,12 @@ def process_payment(payment, simulate_failure=False):
     Process a payment using a mock gateway.
     Update payment status and create notifications atomically.
     """
+    if not settings.MOCK_PAYMENT_ENABLED:
+        raise PaymentServiceError(
+            "Mock payment processing is disabled. "
+            "Configure a real payment gateway or explicitly enable "
+            "mock payments for development."
+        )
     with transaction.atomic():
         payment = Payment.objects.select_for_update().get(pk=payment.pk)
 
@@ -114,12 +120,19 @@ def process_payment(payment, simulate_failure=False):
 
 
 def release_payment(payment):
-    """Represent release of a successful payment to the payee."""
-    if payment.status != Payment.Status.SUCCESS:
-        raise PaymentServiceError(
-            "Only successful payments can be released."
-        )
+    """Release a successful payment to the payee exactly once."""
+    with transaction.atomic():
+        payment = Payment.objects.select_for_update().get(pk=payment.pk)
 
-    payment.status = Payment.Status.RELEASED
-    payment.save(update_fields=["status", "updated_at"])
-    return payment
+        if payment.status == Payment.Status.RELEASED:
+            return payment
+
+        if payment.status != Payment.Status.SUCCESS:
+            raise PaymentServiceError(
+                "Only successful payments can be released."
+            )
+
+        payment.status = Payment.Status.RELEASED
+        payment.save(update_fields=["status", "updated_at"])
+
+        return payment

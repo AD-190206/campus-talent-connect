@@ -2,11 +2,15 @@
 import os
 
 import jwt
+from uuid import UUID
 from rest_framework import exceptions
 from rest_framework.authentication import BaseAuthentication, get_authorization_header
 
 
 class JWTAuthentication(BaseAuthentication):
+    def authenticate_header(self, request):
+        return "Bearer"
+
     def authenticate(self, request):
         auth = get_authorization_header(request).split()
 
@@ -36,21 +40,44 @@ class JWTAuthentication(BaseAuthentication):
                 token,
                 secret,
                 algorithms=["HS256"],
+                options={
+                    "require": [
+                        "user_id",
+                        "role",
+                        "iat",
+                        "exp",
+                        "token_type",
+                    ],
+                },
             )
         except jwt.ExpiredSignatureError:
             raise exceptions.AuthenticationFailed("Token has expired.")
         except jwt.InvalidTokenError:
             raise exceptions.AuthenticationFailed("Invalid token.")
 
-        user_id = (
-            payload.get("user_id")
-            or payload.get("id")
-            or payload.get("sub")
-        )
+        user_id = payload["user_id"]
+        role = payload["role"]
 
-        if not user_id:
+        if not isinstance(user_id, str) or not user_id.strip():
             raise exceptions.AuthenticationFailed(
-                "Token does not contain a user identifier."
+                "Token must contain a valid user identifier."
+            )
+
+        try:
+            UUID(user_id)
+        except (ValueError, AttributeError):
+            raise exceptions.AuthenticationFailed(
+                "Token must contain a valid UUID user identifier."
+            )
+
+        if role not in {"STUDENT", "CLIENT", "ADMIN"}:
+            raise exceptions.AuthenticationFailed(
+                "Token contains an invalid role."
+            )
+
+        if payload["token_type"] != "access":
+            raise exceptions.AuthenticationFailed(
+                "An access token is required."
             )
 
         # This service does not own the user database. Use the verified
@@ -63,6 +90,7 @@ class JWTUser:
         self.id = str(user_id)
         self.pk = self.id
         self.payload = payload
+        self.role = payload["role"]
         self.is_authenticated = True
         self.is_anonymous = False
 
