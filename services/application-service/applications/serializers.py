@@ -1,4 +1,4 @@
-from rest_framework import serializers
+﻿from rest_framework import serializers
 from .models import Application, Assignment, ApplicationStatus, AssignmentStatus
 
 
@@ -12,7 +12,7 @@ class ApplicationCreateSerializer(serializers.ModelSerializer):
 
 
 class ApplicationListSerializer(serializers.ModelSerializer):
-    """Full application detail — used for listing and retrieving."""
+    """Full application detail â€” used for listing and retrieving."""
 
     class Meta:
         model  = Application
@@ -21,7 +21,7 @@ class ApplicationListSerializer(serializers.ModelSerializer):
 
 
 class ApplicationUpdateSerializer(serializers.ModelSerializer):
-    """Used for PUT — student can update proposal and resume_url only."""
+    """Used for PUT â€” student can update proposal and resume_url only."""
 
     class Meta:
         model  = Application
@@ -79,9 +79,9 @@ class ApplicationWithdrawSerializer(serializers.ModelSerializer):
 
 
 class AssignmentSerializer(serializers.ModelSerializer):
-    """Full assignment detail — used by Person 4 (Work & Review) and Person 5 (Payment)."""
+    """Full assignment detail â€” used by Person 4 (Work & Review) and Person 5 (Payment)."""
 
     class Meta:
         model  = Assignment
-        fields = ["id", "application_id", "student_id", "project_id",
+        fields = ["id", "application_id", "student_id", "client_id", "project_id",
                   "status", "assigned_date", "completion_date"]

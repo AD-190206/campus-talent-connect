@@ -1,3 +1,4 @@
+﻿import uuid
 from django.db import models
 
 
@@ -16,8 +17,9 @@ class AssignmentStatus(models.TextChoices):
 
 
 class Application(models.Model):
-    student_id = models.IntegerField()
-    project_id = models.IntegerField()
+    id         = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    student_id = models.UUIDField()
+    project_id = models.UUIDField()
     proposal   = models.TextField()
     resume_url = models.URLField(blank=True, default="")
     status     = models.CharField(
@@ -33,14 +35,16 @@ class Application(models.Model):
         ordering = ["-created_at"]
 
     def __str__(self):
-        return f"Application #{self.id} | student={self.student_id} project={self.project_id} [{self.status}]"
+        return f"Application {self.id} | student={self.student_id} project={self.project_id} [{self.status}]"
 
 
 class Assignment(models.Model):
-    application_id  = models.IntegerField(unique=True)
-    student_id      = models.IntegerField()
-    project_id      = models.IntegerField()
-    status          = models.CharField(
+    id             = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    application_id = models.UUIDField(unique=True)
+    student_id     = models.UUIDField()
+    client_id      = models.UUIDField(default=uuid.UUID("00000000-0000-0000-0000-000000000000"))
+    project_id     = models.UUIDField()
+    status         = models.CharField(
         max_length=20,
         choices=AssignmentStatus.choices,
         default=AssignmentStatus.ACTIVE,
@@ -52,4 +56,4 @@ class Assignment(models.Model):
         ordering = ["-assigned_date"]
 
     def __str__(self):
-        return f"Assignment #{self.id} | student={self.student_id} project={self.project_id} [{self.status}]"
+        return f"Assignment {self.id} | student={self.student_id} project={self.project_id} [{self.status}]"
