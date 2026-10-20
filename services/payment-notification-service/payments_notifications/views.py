@@ -75,14 +75,14 @@ class PaymentListCreateView(APIView):
         except (TypeError, ValueError):
             return error_response(
                 "page and page_size must be integers.",
-                "INVALID_PAGINATION",
+                "VALIDATION_ERROR",
                 status.HTTP_400_BAD_REQUEST,
             )
 
         if page < 1 or page_size < 1 or page_size > 100:
             return error_response(
                 "page must be at least 1 and page_size must be between 1 and 100.",
-                "INVALID_PAGINATION",
+                "VALIDATION_ERROR",
                 status.HTTP_400_BAD_REQUEST,
             )
 
@@ -218,12 +218,14 @@ class PaymentListCreateView(APIView):
                     status.HTTP_502_BAD_GATEWAY,
                 )
 
-            if payment_data["amount"] > project_budget:
+            if not project_budget.is_finite() or project_budget <= 0:
                 return error_response(
-                    "Payment amount cannot exceed the project budget.",
-                    "PAYMENT_EXCEEDS_PROJECT_BUDGET",
-                    status.HTTP_400_BAD_REQUEST,
+                    "Project service returned an invalid budget.",
+                    "UPSTREAM_INVALID_RESPONSE",
+                    status.HTTP_502_BAD_GATEWAY,
                 )
+
+            payment_data["amount"] = project_budget.quantize(Decimal("0.01"))
 
         except UpstreamServiceError as exc:
             return error_response(
@@ -258,10 +260,10 @@ class PaymentListCreateView(APIView):
             status=response_status,
         )
 
-
 class PaymentDetailView(APIView):
     def get(self, request, payment_id):
         user_id = getattr(request.user, "id", None)
+        role = getattr(request.user, "role", None)
 
         if not user_id:
             return error_response(
@@ -270,19 +272,26 @@ class PaymentDetailView(APIView):
                 status.HTTP_401_UNAUTHORIZED,
             )
 
-        payment = get_object_or_404(
-            Payment.objects.filter(
-                payer_id=user_id
-            ) | Payment.objects.filter(
-                payee_id=user_id
-            ),
-            id=payment_id,
-        )
+        if role == "ADMIN":
+            payment = get_object_or_404(
+                Payment,
+                id=payment_id,
+            )
+        else:
+            payment = get_object_or_404(
+                Payment.objects.filter(
+                    payer_id=user_id
+                ) | Payment.objects.filter(
+                    payee_id=user_id
+                ),
+                id=payment_id,
+            )
 
         return Response({
             "data": PaymentSerializer(payment).data,
             "message": "Payment retrieved successfully",
         })
+
 
 
 class ProcessPaymentView(APIView):
@@ -340,14 +349,76 @@ class ReleasePaymentView(APIView):
                 status.HTTP_401_UNAUTHORIZED,
             )
 
-        # Only the payment's payer can request release.
         payment = get_object_or_404(
             Payment.objects.filter(payer_id=user_id),
             id=payment_id,
         )
 
+        authorization = request.headers.get("Authorization")
+
         try:
+            assignment = get_assignment(
+                payment.assignment_id,
+                authorization,
+            )
+
+            if not isinstance(assignment, dict):
+                return error_response(
+                    "Assignment service returned invalid data.",
+                    "UPSTREAM_INVALID_RESPONSE",
+                    status.HTTP_502_BAD_GATEWAY,
+                )
+
+            project_id = assignment.get("project_id")
+            student_id = assignment.get("student_id")
+
+            if not project_id or not student_id:
+                return error_response(
+                    "Assignment service response is incomplete.",
+                    "UPSTREAM_INVALID_RESPONSE",
+                    status.HTTP_502_BAD_GATEWAY,
+                )
+
+            if str(student_id) != str(payment.payee_id):
+                return error_response(
+                    "Payment payee does not match the assignment student.",
+                    "PAYEE_ASSIGNMENT_MISMATCH",
+                    status.HTTP_409_CONFLICT,
+                )
+
+            project = get_project(project_id, authorization)
+
+            if not isinstance(project, dict):
+                return error_response(
+                    "Project service returned invalid data.",
+                    "UPSTREAM_INVALID_RESPONSE",
+                    status.HTTP_502_BAD_GATEWAY,
+                )
+
+            client_id = project.get("client_id")
+
+            if not client_id:
+                return error_response(
+                    "Project service response is incomplete.",
+                    "UPSTREAM_INVALID_RESPONSE",
+                    status.HTTP_502_BAD_GATEWAY,
+                )
+
+            if str(client_id) != str(payment.payer_id):
+                return error_response(
+                    "Payment payer does not own the project.",
+                    "PAYER_PROJECT_MISMATCH",
+                    status.HTTP_403_FORBIDDEN,
+                )
+
             payment = release_payment(payment)
+
+        except UpstreamServiceError as exc:
+            return error_response(
+                str(exc),
+                exc.code,
+                exc.http_status,
+            )
         except PaymentServiceError:
             return error_response(
                 "Payment release is not allowed.",
@@ -359,7 +430,6 @@ class ReleasePaymentView(APIView):
             "data": PaymentSerializer(payment).data,
             "message": "Payment marked as released",
         })
-
 
 class NotificationListCreateView(APIView):
 
@@ -387,14 +457,14 @@ class NotificationListCreateView(APIView):
         except (TypeError, ValueError):
             return error_response(
                 "page and page_size must be integers.",
-                "INVALID_PAGINATION",
+                "VALIDATION_ERROR",
                 status.HTTP_400_BAD_REQUEST,
             )
 
         if page < 1 or page_size < 1 or page_size > 100:
             return error_response(
                 "page must be at least 1 and page_size must be between 1 and 100.",
-                "INVALID_PAGINATION",
+                "VALIDATION_ERROR",
                 status.HTTP_400_BAD_REQUEST,
             )
 

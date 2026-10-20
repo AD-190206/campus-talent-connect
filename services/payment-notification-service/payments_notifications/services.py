@@ -18,9 +18,14 @@ def create_payment(validated_data):
     """
     key = validated_data.get("idempotency_key")
 
+    if not isinstance(key, str) or not key.strip():
+        raise PaymentServiceError(
+            "A non-empty idempotency key is required."
+        )
+
+    key = key.strip()
+
     def find_existing():
-        if not key:
-            return None
         return Payment.objects.filter(idempotency_key=key).first()
 
     def matches(existing):

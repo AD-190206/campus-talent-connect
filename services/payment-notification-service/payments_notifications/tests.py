@@ -90,7 +90,7 @@ class PaymentNotificationAPITests(TestCase):
         )
         self.assertEqual(Payment.objects.count(), 0)
 
-    def test_payment_exceeding_project_budget_is_rejected(self):
+    def test_payment_amount_comes_from_project_budget(self):
         self.project_patcher.stop()
         self.project_patcher = patch(
             "payments_notifications.views.get_project",
@@ -103,12 +103,9 @@ class PaymentNotificationAPITests(TestCase):
 
         response = self.create_payment()
 
-        self.assertEqual(response.status_code, 400)
-        self.assertEqual(
-            response.data["code"],
-            "PAYMENT_EXCEEDS_PROJECT_BUDGET",
-        )
-        self.assertEqual(Payment.objects.count(), 0)
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data["data"]["amount"], "1000.00")
+        self.assertEqual(Payment.objects.count(), 1)
 
     def test_payment_rejects_invalid_project_budget(self):
         self.project_patcher.stop()
@@ -150,18 +147,21 @@ class PaymentNotificationAPITests(TestCase):
         self.assertEqual(Payment.objects.count(), 1)
 
     def test_duplicate_key_with_different_amount_returns_conflict(self):
-        self.create_payment()
+        first = self.create_payment()
+        self.assertEqual(first.status_code, 201)
 
+        # The client-supplied amount is ignored; the project budget
+        # determines the amount, so the same request remains idempotent.
         changed_payload = {
             **self.payload,
             "amount": "2500.00",
         }
         response = self.create_payment(changed_payload)
 
-        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.status_code, 200)
         self.assertEqual(
-            response.data["code"],
-            "IDEMPOTENCY_KEY_CONFLICT",
+            first.data["data"]["id"],
+            response.data["data"]["id"],
         )
         self.assertEqual(Payment.objects.count(), 1)
 
@@ -182,6 +182,27 @@ class PaymentNotificationAPITests(TestCase):
         )
         self.assertEqual(Notification.objects.count(), 2)
 
+    def test_reprocessing_successful_payment_does_not_duplicate_notifications(self):
+        response = self.create_payment()
+        payment_id = response.data["data"]["id"]
+
+        first_process = self.client.post(
+            f"/api/payments/{payment_id}/process/",
+            {"simulate_failure": False},
+            format="json",
+        )
+        self.assertEqual(first_process.status_code, 200)
+        self.assertEqual(Notification.objects.count(), 2)
+
+        second_process = self.client.post(
+            f"/api/payments/{payment_id}/process/",
+            {"simulate_failure": False},
+            format="json",
+        )
+        self.assertEqual(second_process.status_code, 200)
+        self.assertEqual(second_process.data["data"]["status"], "SUCCESS")
+        self.assertEqual(Notification.objects.count(), 2)
+
     def test_simulated_failure_creates_notifications(self):
         response = self.create_payment()
         payment_id = response.data["data"]["id"]
@@ -196,6 +217,35 @@ class PaymentNotificationAPITests(TestCase):
         self.assertEqual(processed.data["data"]["status"], "FAILED")
         self.assertEqual(Notification.objects.count(), 2)
 
+    def test_reprocessing_failed_payment_does_not_duplicate_notifications(self):
+        response = self.create_payment()
+        payment_id = response.data["data"]["id"]
+
+        first_process = self.client.post(
+            f"/api/payments/{payment_id}/process/",
+            {"simulate_failure": True},
+            format="json",
+        )
+
+        self.assertEqual(first_process.status_code, 200)
+        self.assertEqual(
+            first_process.data["data"]["status"],
+            "FAILED",
+        )
+        self.assertEqual(Notification.objects.count(), 2)
+
+        second_process = self.client.post(
+            f"/api/payments/{payment_id}/process/",
+            {"simulate_failure": False},
+            format="json",
+        )
+
+        self.assertEqual(second_process.status_code, 200)
+        self.assertEqual(
+            second_process.data["data"]["status"],
+            "FAILED",
+        )
+        self.assertEqual(Notification.objects.count(), 2)
     def test_notification_creation_and_listing(self):
         payload = {
             "user_id": self.user_id,
@@ -219,23 +269,56 @@ class PaymentNotificationAPITests(TestCase):
             "Test notification",
         )
 
-    def test_zero_amount_is_rejected(self):
+    def test_notification_rejects_blank_message(self):
+        response = self.client.post(
+            "/api/notifications/",
+            {
+                "user_id": self.user_id,
+                "type": "IN_APP",
+                "event": "TEST_EVENT",
+                "message": "   ",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_notification_trims_message_whitespace(self):
+        response = self.client.post(
+            "/api/notifications/",
+            {
+                "user_id": self.user_id,
+                "type": "IN_APP",
+                "event": "TEST_EVENT",
+                "message": "  Test notification  ",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(
+            response.data["data"]["message"],
+            "Test notification",
+        )
+
+    def test_missing_idempotency_key_is_rejected(self):
         payload = {
-            **self.payload,
-            "idempotency_key": "zero-amount-test",
-            "amount": "0.00",
+            "assignment_id": self.payload["assignment_id"],
+            "payee_id": self.payload["payee_id"],
         }
 
         response = self.create_payment(payload)
 
         self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data["code"], "VALIDATION_ERROR")
+        self.assertIn("idempotency_key", response.data["details"])
         self.assertEqual(Payment.objects.count(), 0)
 
     def test_validation_error_includes_details_field(self):
         payload = {
-            **self.payload,
-            "idempotency_key": "zero-amount-details-test",
-            "amount": "0.00",
+            "assignment_id": self.payload["assignment_id"],
+            "payee_id": self.payload["payee_id"],
+            # Deliberately omit the required idempotency_key.
         }
 
         response = self.create_payment(payload)
@@ -244,7 +327,8 @@ class PaymentNotificationAPITests(TestCase):
         self.assertEqual(response.data["code"], "VALIDATION_ERROR")
         self.assertEqual(response.data["error"], "Request validation failed.")
         self.assertIn("details", response.data)
-        self.assertIn("amount", response.data["details"])
+        self.assertIn("idempotency_key", response.data["details"])
+        self.assertEqual(Payment.objects.count(), 0)
 
     def test_payment_history_only_returns_payments_involving_current_user(self):
         own_payload = {
@@ -289,6 +373,45 @@ class PaymentNotificationAPITests(TestCase):
 
         self.assertEqual(response.status_code, 404)
 
+    def test_admin_can_view_another_users_payment(self):
+        payment = Payment.objects.create(
+            assignment_id=uuid4(),
+            payer_id=str(uuid4()),
+            payee_id=str(uuid4()),
+            amount="1500.00",
+            fee="0.00",
+            idempotency_key="admin-detail-test",
+        )
+
+        admin_id = str(uuid4())
+        token = jwt.encode(
+            {
+                "user_id": admin_id,
+                "role": "ADMIN",
+                "iat": int(__import__("time").time()),
+                "exp": int(__import__("time").time()) + 300,
+                "token_type": "access",
+            },
+            os.getenv("JWT_SECRET_KEY"),
+            algorithm="HS256",
+        )
+
+        admin_client = APIClient()
+        admin_client.credentials(
+            HTTP_AUTHORIZATION=f"Bearer {token}"
+        )
+
+        response = admin_client.get(
+            f"/api/payments/{payment.id}/"
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.data["data"]["id"],
+            str(payment.id),
+        )
+
+
     def test_payment_creation_rejects_another_users_as_payer(self):
         payload = {
             **self.payload,
@@ -332,6 +455,17 @@ class PaymentNotificationAPITests(TestCase):
             idempotency_key="successful-release-test",
         )
 
+        self.assignment_patcher.stop()
+        self.assignment_patcher = patch(
+            "payments_notifications.views.get_assignment",
+            return_value={
+                "project_id": str(uuid4()),
+                "student_id": str(payment.payee_id),
+            },
+        )
+        self.assignment_patcher.start()
+        self.addCleanup(self.assignment_patcher.stop)
+
         response = self.client.post(
             f"/api/payments/{payment.id}/release/",
             {},
@@ -355,6 +489,17 @@ class PaymentNotificationAPITests(TestCase):
             idempotency_key="repeated-release-test",
         )
 
+        self.assignment_patcher.stop()
+        self.assignment_patcher = patch(
+            "payments_notifications.views.get_assignment",
+            return_value={
+                "project_id": str(uuid4()),
+                "student_id": str(payment.payee_id),
+            },
+        )
+        self.assignment_patcher.start()
+        self.addCleanup(self.assignment_patcher.stop)
+
         first = self.client.post(
             f"/api/payments/{payment.id}/release/",
             {},
@@ -372,6 +517,86 @@ class PaymentNotificationAPITests(TestCase):
 
         payment.refresh_from_db()
         self.assertEqual(payment.status, Payment.Status.RELEASED)
+
+    def test_release_rejects_assignment_student_mismatch(self):
+        payment = Payment.objects.create(
+            assignment_id=uuid4(),
+            payer_id=self.user_id,
+            payee_id=str(uuid4()),
+            amount="1500.00",
+            fee="0.00",
+            status=Payment.Status.SUCCESS,
+            idempotency_key="release-payee-mismatch-test",
+        )
+
+        self.assignment_patcher.stop()
+        self.assignment_patcher = patch(
+            "payments_notifications.views.get_assignment",
+            return_value={
+                "project_id": str(uuid4()),
+                "student_id": str(uuid4()),
+            },
+        )
+        self.assignment_patcher.start()
+        self.addCleanup(self.assignment_patcher.stop)
+
+        response = self.client.post(
+            f"/api/payments/{payment.id}/release/",
+            {},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(
+            response.data["code"],
+            "PAYEE_ASSIGNMENT_MISMATCH",
+        )
+        payment.refresh_from_db()
+        self.assertEqual(payment.status, Payment.Status.SUCCESS)
+
+    def test_release_rejects_project_owner_mismatch(self):
+        payment = Payment.objects.create(
+            assignment_id=uuid4(),
+            payer_id=self.user_id,
+            payee_id=str(uuid4()),
+            amount="1500.00",
+            fee="0.00",
+            status=Payment.Status.SUCCESS,
+            idempotency_key="release-owner-mismatch-test",
+        )
+
+        self.assignment_patcher.stop()
+        self.assignment_patcher = patch(
+            "payments_notifications.views.get_assignment",
+            return_value={
+                "project_id": str(uuid4()),
+                "student_id": str(payment.payee_id),
+            },
+        )
+        self.assignment_patcher.start()
+        self.addCleanup(self.assignment_patcher.stop)
+
+        self.project_patcher.stop()
+        self.project_patcher = patch(
+            "payments_notifications.views.get_project",
+            return_value={"client_id": str(uuid4())},
+        )
+        self.project_patcher.start()
+        self.addCleanup(self.project_patcher.stop)
+
+        response = self.client.post(
+            f"/api/payments/{payment.id}/release/",
+            {},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(
+            response.data["code"],
+            "PAYER_PROJECT_MISMATCH",
+        )
+        payment.refresh_from_db()
+        self.assertEqual(payment.status, Payment.Status.SUCCESS)
 
     def test_unrelated_user_cannot_release_payment(self):
         payment = Payment.objects.create(
@@ -475,7 +700,7 @@ class PaymentNotificationAPITests(TestCase):
         response = self.client.get("/api/payments/?page_size=101")
 
         self.assertEqual(response.status_code, 400)
-        self.assertEqual(response.data["code"], "INVALID_PAGINATION")
+        self.assertEqual(response.data["code"], "VALIDATION_ERROR")
         self.assertIn("details", response.data)
 
     def test_notification_list_returns_pagination_metadata(self):
@@ -511,7 +736,7 @@ class PaymentNotificationAPITests(TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertEqual(
             response.data["code"],
-            "INVALID_PAGINATION",
+            "VALIDATION_ERROR",
         )
         self.assertIn("details", response.data)
 

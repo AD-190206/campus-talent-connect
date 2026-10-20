@@ -1,4 +1,3 @@
-
 from rest_framework import serializers
 from .models import Payment, Notification
 
@@ -10,23 +9,18 @@ class PaymentCreateSerializer(serializers.ModelSerializer):
         fields = [
             "assignment_id",
             "payee_id",
-            "amount",
             "idempotency_key",
         ]
 
         extra_kwargs = {
             "idempotency_key": {
-                "required": False,
-                "allow_null": True,
+                "required": True,
+                "allow_null": False,
+                "allow_blank": False,
                 "validators": [],
             },
         }
 
-    def validate_amount(self, value):
-        if value <= 0:
-            raise serializers.ValidationError(
-                "Amount must be greater than zero.")
-        return value
 
 
 class PaymentSerializer(serializers.ModelSerializer):
@@ -49,13 +43,22 @@ class PaymentSerializer(serializers.ModelSerializer):
 
 
 class NotificationCreateSerializer(serializers.ModelSerializer):
+    message = serializers.CharField(
+        required=True,
+        allow_null=False,
+        allow_blank=False,
+        trim_whitespace=True,
+    )
+
     class Meta:
         model = Notification
         fields = ["user_id", "type", "event", "message"]
 
     def validate_message(self, value):
-        if not value.strip():
-            raise serializers.ValidationError("Message cannot be empty.")
+        if not value:
+            raise serializers.ValidationError(
+                "Message cannot be empty."
+            )
         return value
 
 
