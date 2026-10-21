@@ -1,0 +1,184 @@
+@import "tailwindcss";
+
+/* Sage & Slate design system.
+   Every colour is a CSS variable; components use the semantic Tailwind
+   colours below (bg-surface, text-muted, …) so both themes stay in sync. */
+
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+
+:root {
+  color-scheme: light;
+
+  --bg: #f7f8f5;
+  --surface: #ffffff;
+  --surface-2: #eef1ec;
+  --fg: #26332d;
+  --muted: #69746d;
+  --primary: #244c3b;
+  --primary-hover: #1c3d2f;
+  --on-primary: #ffffff;
+  --accent: #dce8dd;
+  --accent-fg: #244c3b;
+  --line: #dde2da;
+  --line-strong: #c9d0c5;
+  --ring: #244c3b;
+
+  --success: #2f6b47;
+  --success-soft: #e1efe4;
+  --warning: #85570f;
+  --warning-soft: #f6ecd8;
+  --danger: #a23b32;
+  --danger-soft: #f7e1de;
+  --info: #2f5a73;
+  --info-soft: #e0ecf2;
+
+  --shadow-color: 150 20% 20%;
+}
+
+[data-theme="dark"] {
+  color-scheme: dark;
+
+  --bg: #151a18;
+  --surface: #202723;
+  --surface-2: #272f2a;
+  --fg: #f1f4f0;
+  --muted: #aab6ad;
+  --primary: #a5c8ad;
+  --primary-hover: #b8d5be;
+  --on-primary: #14201a;
+  --accent: #2c3c32;
+  --accent-fg: #c7dfcc;
+  --line: #39443d;
+  --line-strong: #4a574e;
+  --ring: #a5c8ad;
+
+  --success: #9cd0aa;
+  --success-soft: #22382a;
+  --warning: #e3c27e;
+  --warning-soft: #3a3020;
+  --danger: #efa49b;
+  --danger-soft: #3d2422;
+  --info: #9cc3da;
+  --info-soft: #1f3340;
+
+  --shadow-color: 150 30% 2%;
+}
+
+@theme inline {
+  --font-sans: var(--font-inter), ui-sans-serif, system-ui, -apple-system,
+    "Segoe UI", sans-serif;
+
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-fg: var(--fg);
+  --color-muted: var(--muted);
+  --color-primary: var(--primary);
+  --color-primary-hover: var(--primary-hover);
+  --color-on-primary: var(--on-primary);
+  --color-accent: var(--accent);
+  --color-accent-fg: var(--accent-fg);
+  --color-line: var(--line);
+  --color-line-strong: var(--line-strong);
+  --color-ring: var(--ring);
+
+  --color-success: var(--success);
+  --color-success-soft: var(--success-soft);
+  --color-warning: var(--warning);
+  --color-warning-soft: var(--warning-soft);
+  --color-danger: var(--danger);
+  --color-danger-soft: var(--danger-soft);
+  --color-info: var(--info);
+  --color-info-soft: var(--info-soft);
+
+  --shadow-soft: 0 1px 2px hsl(var(--shadow-color) / 0.06),
+    0 1px 1px hsl(var(--shadow-color) / 0.04);
+  --shadow-pop: 0 8px 24px hsl(var(--shadow-color) / 0.12),
+    0 2px 6px hsl(var(--shadow-color) / 0.08);
+}
+
+@layer base {
+  *,
+  ::before,
+  ::after {
+    border-color: var(--line);
+  }
+
+  html {
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: var(--font-sans);
+    font-feature-settings: "cv11", "ss01";
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  /* Smooth colour change only while the theme is being switched. */
+  html.theme-transition,
+  html.theme-transition *,
+  html.theme-transition *::before,
+  html.theme-transition *::after {
+    transition: background-color 180ms ease, border-color 180ms ease,
+      color 180ms ease !important;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
+  }
+
+  ::selection {
+    background: var(--accent);
+    color: var(--fg);
+  }
+
+  dialog::backdrop {
+    background: rgb(10 14 12 / 0.45);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+}
+
+@layer components {
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 0.75rem;
+  }
+
+  .label-caps {
+    font-size: 0.6875rem;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.animate-fade-in {
+  animation: fade-in 160ms ease-out;
+}
