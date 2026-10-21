@@ -10,7 +10,6 @@ from .views import (
     RefreshTokenView,
     UserDetailView,
     DeactivateUserView,
-    LogoutView,
 )
 
 
@@ -31,5 +30,4 @@ path(
     DeactivateUserView.as_view(),
     name="deactivate-user",
 ),
-path("auth/logout/", LogoutView.as_view(), name="logout"),
 ]
