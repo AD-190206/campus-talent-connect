@@ -139,12 +139,35 @@ docker compose exec work-review-service python manage.py test
 docker compose exec payment-notification-service python manage.py test
 ```
 
-## Frontend integration
+## Frontend
 
-`frontend/lib/api.js` is a small client for every gateway endpoint. It uses
-`NEXT_PUBLIC_API_BASE_URL`, unwraps the `{data, message, pagination}` envelope,
-throws `ApiError` (`status`, `code`, `details`) for the error envelope, and
-refreshes an expired access token once using the stored refresh token.
+Next.js 15 (App Router) + React 19 + TypeScript + Tailwind CSS 4, using the
+"Sage & Slate" design system with light and dark themes. It runs in Docker with
+the rest of the stack at http://localhost:3000 and talks only to the gateway
+(`NEXT_PUBLIC_API_BASE_URL`, default `http://localhost:8000/api`).
+
+```bash
+cd frontend
+npm ci
+npm run dev        # http://localhost:3000
+npm run typecheck
+npm run build
+```
+
+Layout:
+
+- `app/`: routes. `(auth)` holds login/register; `(app)` holds the signed-in
+  workspace (dashboard, projects, applications, assignments, payments,
+  notifications, profile, settings, admin).
+- `components/ui/`: buttons, fields, dialogs, badges, feedback states.
+- `lib/api.ts`: typed client for every gateway endpoint. It unwraps the
+  `{data, message, pagination}` envelope, throws `ApiError`
+  (`status`, `code`, `details`), and refreshes an expired access token once.
+- `lib/theme.tsx`: light/dark/system theme, persisted, applied before first
+  paint. Colours are CSS variables in `app/globals.css`.
+
+Navigation and actions adapt to the signed-in role, but the backend enforces
+every permission.
 
 ## Repository layout
 
