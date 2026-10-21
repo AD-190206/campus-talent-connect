@@ -45,6 +45,11 @@ class ContractPagination(PageNumberPagination):
                 "page": self.page.number,
                 "page_size": self.page.paginator.per_page,
                 "total": self.page.paginator.count,
-                "total_pages": self.page.paginator.num_pages,
+                # Django reports one (empty) page; the contract wants 0.
+                "total_pages": (
+                    self.page.paginator.num_pages
+                    if self.page.paginator.count
+                    else 0
+                ),
             },
         })

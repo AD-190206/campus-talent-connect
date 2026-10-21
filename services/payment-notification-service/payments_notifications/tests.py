@@ -43,6 +43,13 @@ class PaymentNotificationAPITests(TestCase):
         self.project_patcher.start()
         self.addCleanup(self.project_patcher.stop)
 
+        self.work_patcher = patch(
+            "payments_notifications.views.get_work_for_assignment",
+            return_value=[{"status": "SUBMITTED"}],
+        )
+        self.work_lookup = self.work_patcher.start()
+        self.addCleanup(self.work_patcher.stop)
+
     def create_payment(self, payload=None):
         return self.client.post(
             "/api/payments/",
@@ -311,7 +318,7 @@ class PaymentNotificationAPITests(TestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.data["code"], "VALIDATION_ERROR")
-        self.assertIn("idempotency_key", response.data["details"])
+        self.assertIn("idempotency_key", response.data["details"]["fields"])
         self.assertEqual(Payment.objects.count(), 0)
 
     def test_validation_error_includes_details_field(self):
@@ -327,7 +334,7 @@ class PaymentNotificationAPITests(TestCase):
         self.assertEqual(response.data["code"], "VALIDATION_ERROR")
         self.assertEqual(response.data["error"], "Request validation failed.")
         self.assertIn("details", response.data)
-        self.assertIn("idempotency_key", response.data["details"])
+        self.assertIn("idempotency_key", response.data["details"]["fields"])
         self.assertEqual(Payment.objects.count(), 0)
 
     def test_payment_history_only_returns_payments_involving_current_user(self):
@@ -630,6 +637,131 @@ class PaymentNotificationAPITests(TestCase):
 
         payment.refresh_from_db()
         self.assertEqual(payment.status, Payment.Status.PENDING)
+
+    def make_successful_payment(self):
+        payment = Payment.objects.create(
+            assignment_id=uuid4(),
+            payer_id=self.user_id,
+            payee_id=self.payload["payee_id"],
+            amount="1500.00",
+            fee="0.00",
+            status=Payment.Status.SUCCESS,
+            idempotency_key=f"release-{uuid4()}",
+        )
+        return payment
+
+    def test_release_requires_submitted_work(self):
+        payment = self.make_successful_payment()
+        self.work_lookup.return_value = [{"status": "DRAFT"}]
+
+        response = self.client.post(
+            f"/api/payments/{payment.id}/release/", {}, format="json"
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.data["code"], "PAYMENT_RELEASE_NOT_ALLOWED")
+        payment.refresh_from_db()
+        self.assertEqual(payment.status, Payment.Status.SUCCESS)
+
+    def test_release_notifies_payer_and_payee(self):
+        payment = self.make_successful_payment()
+
+        response = self.client.post(
+            f"/api/payments/{payment.id}/release/", {}, format="json"
+        )
+
+        self.assertEqual(response.status_code, 200)
+        released = Notification.objects.filter(event="PAYMENT_RELEASED")
+        self.assertEqual(
+            {str(n.user_id) for n in released},
+            {str(payment.payer_id), str(payment.payee_id)},
+        )
+
+        # Releasing again is idempotent and creates no new notifications.
+        self.client.post(f"/api/payments/{payment.id}/release/", {}, format="json")
+        self.assertEqual(released.count(), 2)
+
+    def test_release_reports_work_service_outage(self):
+        payment = self.make_successful_payment()
+        self.work_lookup.side_effect = UpstreamServiceError(
+            "down", "UPSTREAM_UNAVAILABLE", 503
+        )
+
+        response = self.client.post(
+            f"/api/payments/{payment.id}/release/", {}, format="json"
+        )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.data["code"], "UPSTREAM_UNAVAILABLE")
+
+    def test_second_active_payment_for_assignment_conflicts(self):
+        first = self.create_payment()
+        self.assertEqual(first.status_code, 201)
+
+        payload = dict(self.payload, idempotency_key="another-key")
+        response = self.create_payment(payload)
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.data["code"], "CONFLICT")
+        self.assertEqual(
+            response.data["details"]["payment_id"], first.data["data"]["id"]
+        )
+
+    def test_payment_response_identifies_mock_mode_and_fee(self):
+        response = self.create_payment()
+        data = response.data["data"]
+        self.assertEqual(data["payment_mode"], "MOCK")
+        self.assertEqual(data["fee"], "0.00")
+        self.assertEqual(data["net_amount"], data["amount"])
+
+    def test_payment_list_filters_by_assignment(self):
+        self.create_payment()
+        other = Payment.objects.create(
+            assignment_id=uuid4(),
+            payer_id=self.user_id,
+            payee_id=uuid4(),
+            amount="10.00",
+            idempotency_key="other-assignment",
+        )
+
+        response = self.client.get(
+            f"/api/payments/?assignment_id={self.payload['assignment_id']}"
+        )
+
+        self.assertEqual(response.status_code, 200)
+        ids = [p["id"] for p in response.data["data"]]
+        self.assertEqual(len(ids), 1)
+        self.assertNotIn(str(other.id), ids)
+
+        response = self.client.get("/api/payments/?assignment_id=nope")
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data["code"], "VALIDATION_ERROR")
+
+    def test_empty_list_has_zero_total_pages(self):
+        response = self.client.get("/api/notifications/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["pagination"]["total"], 0)
+        self.assertEqual(response.data["pagination"]["total_pages"], 0)
+
+    @override_settings(MOCK_PAYMENT_ENABLED=False)
+    def test_processing_without_provider_returns_503(self):
+        payment_id = self.create_payment().data["data"]["id"]
+        response = self.client.post(
+            f"/api/payments/{payment_id}/process/", {}, format="json"
+        )
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.data["code"], "PAYMENT_PROVIDER_UNAVAILABLE")
+
+    def test_errors_use_common_envelope(self):
+        response = self.client.get(f"/api/payments/{uuid4()}/")
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.data["code"], "NOT_FOUND")
+        self.assertEqual(response.data["details"], {})
+
+        anonymous = APIClient()
+        response = anonymous.get("/api/payments/")
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.data["code"], "UNAUTHORIZED")
 
     def test_pending_payment_cannot_be_released(self):
         response = self.create_payment()

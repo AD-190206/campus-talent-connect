@@ -117,6 +117,35 @@ Check running containers:
 docker compose ps
 ```
 
+## Testing
+
+End-to-end workflow through the gateway (stack must be running; standard
+library only, no installs needed). It runs the full register → project →
+apply → select → work → approve/payment → notification → review flow twice:
+once with the client paying before approval, once with approval creating the
+payment.
+
+```bash
+python scripts/e2e_test.py
+```
+
+Per-service unit/API tests (run inside the service's container):
+
+```bash
+docker compose exec user-service python manage.py test
+docker compose exec project-service python manage.py test
+docker compose exec application-service python manage.py test
+docker compose exec work-review-service python manage.py test
+docker compose exec payment-notification-service python manage.py test
+```
+
+## Frontend integration
+
+`frontend/lib/api.js` is a small client for every gateway endpoint. It uses
+`NEXT_PUBLIC_API_BASE_URL`, unwraps the `{data, message, pagination}` envelope,
+throws `ApiError` (`status`, `code`, `details`) for the error envelope, and
+refreshes an expired access token once using the stored refresh token.
+
 ## Repository layout
 
 ```text

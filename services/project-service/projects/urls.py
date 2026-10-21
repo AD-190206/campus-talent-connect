@@ -6,6 +6,8 @@ from .views import (
     ProjectListCreateView,
     ProjectDetailView,
     PublishProjectView,
+    StartProjectView,
+    CompleteProjectView,
     CloseProjectView,
     ProjectStatusView,
 )
@@ -27,6 +29,16 @@ urlpatterns = [
         "projects/<uuid:project_id>/publish/",
         PublishProjectView.as_view(),
         name="project-publish",
+    ),
+    path(
+        "projects/<uuid:project_id>/start/",
+        StartProjectView.as_view(),
+        name="project-start",
+    ),
+    path(
+        "projects/<uuid:project_id>/complete/",
+        CompleteProjectView.as_view(),
+        name="project-complete",
     ),
     path(
         "projects/<uuid:project_id>/close/",

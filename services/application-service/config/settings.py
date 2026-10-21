@@ -1,5 +1,7 @@
-﻿import os
+import os
 from pathlib import Path
+
+from django.core.exceptions import ImproperlyConfigured
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -64,7 +66,8 @@ DATABASES = {
 AUTH_PASSWORD_VALIDATORS = []
 
 LANGUAGE_CODE = "en-us"
-TIME_ZONE = "Asia/Kolkata"
+# UTC so timestamps are returned as ISO 8601 ending in "Z".
+TIME_ZONE = "UTC"
 USE_I18N = True
 USE_TZ = True
 
@@ -73,14 +76,26 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 CORS_ALLOW_ALL_ORIGINS = True
 
-# JWT Authentication
-JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "change-this-development-jwt-secret")
+# JWT Authentication. The development fallback is only used when DEBUG is on.
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY") or (
+    "development-only-jwt-secret-key-not-for-production" if DEBUG else None
+)
+if not JWT_SECRET_KEY:
+    raise ImproperlyConfigured("JWT_SECRET_KEY must be configured.")
 
 REST_FRAMEWORK = {
-    "DEFAULT_PERMISSION_CLASSES": [
-        "rest_framework.permissions.AllowAny",
-    ],
     "DEFAULT_AUTHENTICATION_CLASSES": [
         "applications.auth.JWTAuthentication",
     ],
+    "DEFAULT_PERMISSION_CLASSES": [
+        "rest_framework.permissions.IsAuthenticated",
+    ],
+    "DEFAULT_RENDERER_CLASSES": [
+        "rest_framework.renderers.JSONRenderer",
+    ],
+    "DEFAULT_PARSER_CLASSES": [
+        "rest_framework.parsers.JSONParser",
+    ],
+    "EXCEPTION_HANDLER": "applications.api.exception_handler",
+    "TEST_REQUEST_DEFAULT_FORMAT": "json",
 }

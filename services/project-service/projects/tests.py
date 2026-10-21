@@ -761,6 +761,44 @@ class ProjectLifecycleApiTests(ApiTestCase):
         response = self.api.delete(self.detail_url(project_id))
         self.assertError(response, 400, "INVALID_STATE_TRANSITION")
 
+    def action_url(self, name, project_id):
+        return reverse(f"project-{name}", kwargs={"project_id": project_id})
+
+    def test_start_and_complete_are_idempotent(self):
+        project_id = self.create_project()
+        self.publish(project_id)
+
+        for _ in range(2):
+            response = self.api.post(self.action_url("start", project_id))
+            self.assertSuccess(response)
+            self.assertEqual(response.data["data"]["status"], "IN_PROGRESS")
+
+        for _ in range(2):
+            response = self.api.post(self.action_url("complete", project_id))
+            self.assertSuccess(response)
+            self.assertEqual(response.data["data"]["status"], "COMPLETED")
+
+    def test_draft_cannot_be_started(self):
+        project_id = self.create_project()
+        response = self.api.post(self.action_url("start", project_id))
+        self.assertError(response, 400, "INVALID_STATE_TRANSITION")
+
+    def test_published_project_cannot_be_completed(self):
+        project_id = self.create_project()
+        self.publish(project_id)
+        response = self.api.post(self.action_url("complete", project_id))
+        self.assertError(response, 400, "INVALID_STATE_TRANSITION")
+
+    def test_only_owner_can_start(self):
+        project_id = self.create_project()
+        self.publish(project_id)
+        self.as_user(self.other_client)
+        response = self.api.post(self.action_url("start", project_id))
+        self.assertError(response, 403, "FORBIDDEN")
+        self.as_user(self.student)
+        response = self.api.post(self.action_url("start", project_id))
+        self.assertError(response, 403, "FORBIDDEN")
+
 
 # ======================================== real JWT authentication tests
 

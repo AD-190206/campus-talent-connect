@@ -24,6 +24,19 @@ class PaymentCreateSerializer(serializers.ModelSerializer):
 
 
 class PaymentSerializer(serializers.ModelSerializer):
+    # Fee is explicit: the platform currently charges no fee, so the payee
+    # receives the full project budget (net_amount = amount - fee).
+    net_amount = serializers.SerializerMethodField()
+    payment_mode = serializers.SerializerMethodField()
+
+    def get_net_amount(self, payment):
+        return str(payment.amount - payment.fee)
+
+    def get_payment_mode(self, payment):
+        from .services import PAYMENT_PROVIDER
+
+        return PAYMENT_PROVIDER
+
     class Meta:
         model = Payment
         fields = [
@@ -33,6 +46,8 @@ class PaymentSerializer(serializers.ModelSerializer):
             "payee_id",
             "amount",
             "fee",
+            "net_amount",
+            "payment_mode",
             "status",
             "transaction_id",
             "idempotency_key",

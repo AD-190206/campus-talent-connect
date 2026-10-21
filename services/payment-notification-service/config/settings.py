@@ -75,7 +75,8 @@ DATABASES = {
 AUTH_PASSWORD_VALIDATORS = []
 
 LANGUAGE_CODE = "en-us"
-TIME_ZONE = "Asia/Kolkata"
+# UTC so timestamps are returned as ISO 8601 ending in "Z".
+TIME_ZONE = "UTC"
 USE_I18N = True
 USE_TZ = True
 
@@ -99,6 +100,10 @@ REST_FRAMEWORK = {
     "DEFAULT_PERMISSION_CLASSES": [
         "rest_framework.permissions.IsAuthenticated",
     ],
+    "DEFAULT_RENDERER_CLASSES": [
+        "rest_framework.renderers.JSONRenderer",
+    ],
+    "EXCEPTION_HANDLER": "payments_notifications.exceptions.custom_exception_handler",
     "COERCE_DECIMAL_TO_STRING": True,
 }
 # Upstream service configuration

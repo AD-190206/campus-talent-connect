@@ -10,13 +10,14 @@ Status = Project.Status
 
 # Lifecycle rules. The service layer is the only place that changes status.
 #
-# IN_PROGRESS, COMPLETED and ARCHIVED are reserved: the API contract has no
-# endpoint that sets them yet, so nothing in this service moves a project
-# into those statuses in this iteration.
+# PUBLISHED -> IN_PROGRESS happens when the Application service assigns a
+# student (start/), and IN_PROGRESS -> COMPLETED when Work & Review approves
+# the deliverable (complete/). Both calls forward the owning client's token.
+# ARCHIVED is reserved; nothing moves a project there in this iteration.
 ALLOWED_TRANSITIONS = {
     Status.DRAFT: {Status.PUBLISHED, Status.CLOSED},
-    Status.PUBLISHED: {Status.CLOSED},
-    Status.IN_PROGRESS: {Status.CLOSED},
+    Status.PUBLISHED: {Status.IN_PROGRESS, Status.CLOSED},
+    Status.IN_PROGRESS: {Status.COMPLETED, Status.CLOSED},
     Status.COMPLETED: set(),
     Status.CLOSED: set(),
     Status.ARCHIVED: set(),
@@ -107,6 +108,42 @@ def publish_project(*, project, client_id):
 
     project.status = Status.PUBLISHED
     project.full_clean()
+    project.save(update_fields=["status", "updated_at"])
+    return project
+
+
+def start_project(*, project, client_id):
+    """Mark a published project as in progress. Repeating it is a no-op."""
+    _check_owner(project, client_id)
+
+    if project.status == Status.IN_PROGRESS:
+        return project
+
+    _check_transition(
+        project,
+        Status.IN_PROGRESS,
+        "Only published projects can be started.",
+    )
+
+    project.status = Status.IN_PROGRESS
+    project.save(update_fields=["status", "updated_at"])
+    return project
+
+
+def complete_project(*, project, client_id):
+    """Mark an in-progress project as completed. Repeating it is a no-op."""
+    _check_owner(project, client_id)
+
+    if project.status == Status.COMPLETED:
+        return project
+
+    _check_transition(
+        project,
+        Status.COMPLETED,
+        "Only in-progress projects can be completed.",
+    )
+
+    project.status = Status.COMPLETED
     project.save(update_fields=["status", "updated_at"])
     return project
 

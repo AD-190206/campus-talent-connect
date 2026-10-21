@@ -1,4 +1,4 @@
-﻿import uuid
+import uuid
 from django.db import models
 
 
@@ -54,6 +54,12 @@ class Assignment(models.Model):
 
     class Meta:
         ordering = ["-assigned_date"]
+        constraints = [
+            # A project has exactly one assigned student.
+            models.UniqueConstraint(
+                fields=["project_id"], name="unique_assignment_per_project"
+            ),
+        ]
 
     def __str__(self):
         return f"Assignment {self.id} | student={self.student_id} project={self.project_id} [{self.status}]"

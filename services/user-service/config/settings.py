@@ -65,7 +65,8 @@ AUTH_PASSWORD_VALIDATORS = []
 AUTH_USER_MODEL = "users.User"
 
 LANGUAGE_CODE = "en-us"
-TIME_ZONE = "Asia/Kolkata"
+# UTC so timestamps are returned as ISO 8601 ending in "Z".
+TIME_ZONE = "UTC"
 USE_I18N = True
 USE_TZ = True
 
@@ -75,6 +76,9 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 CORS_ALLOW_ALL_ORIGINS = True
 
 REST_FRAMEWORK = {
+    "DEFAULT_RENDERER_CLASSES": [
+        "rest_framework.renderers.JSONRenderer",
+    ],
     "DEFAULT_PERMISSION_CLASSES": [
         "rest_framework.permissions.AllowAny",
     ],

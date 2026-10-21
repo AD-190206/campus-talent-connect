@@ -118,3 +118,12 @@ def get_project(project_id, authorization):
         f"/api/projects/{project_id}/",
         authorization,
     )
+
+
+def get_work_for_assignment(assignment_id, authorization):
+    """List the deliverables recorded for an assignment by Work & Review."""
+    return get_upstream_data(
+        settings.WORK_REVIEW_SERVICE_URL,
+        f"/api/work/?assignment_id={assignment_id}&page_size=100",
+        authorization,
+    )

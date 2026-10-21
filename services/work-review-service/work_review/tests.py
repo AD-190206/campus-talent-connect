@@ -1,4 +1,4 @@
-﻿from urllib import request, response
+from urllib import request, response
 
 from django.test import TestCase
 import uuid
@@ -1010,6 +1010,7 @@ class ReviewEndpointTests(APITestCase):
         with patch(
             "work_review.views.get_assignment",
             return_value={
+                "status": "completed",
                 "assignment_id": str(self.assignment_id),
                 "student_id": str(self.reviewer_id),
                 "project_id": str(uuid.uuid4()),
@@ -1064,6 +1065,7 @@ class ReviewEndpointTests(APITestCase):
         with patch(
             "work_review.views.get_assignment",
             return_value={
+                "status": "completed",
                 "assignment_id": str(self.assignment_id),
                 "student_id": str(uuid.uuid4()),
                 "project_id": str(uuid.uuid4()),
@@ -1118,6 +1120,7 @@ class ReviewEndpointTests(APITestCase):
         with patch(
             "work_review.views.get_assignment",
             return_value={
+                "status": "completed",
                 "assignment_id": str(self.assignment_id),
                 "student_id": str(self.reviewer_id),
                 "project_id": str(uuid.uuid4()),
@@ -1137,7 +1140,7 @@ class ReviewEndpointTests(APITestCase):
             response.status_code,
             status.HTTP_400_BAD_REQUEST,
         )
-        self.assertIn("reviewee_id", response.data["details"])
+        self.assertIn("reviewee_id", response.data["details"]["fields"])
         self.assertEqual(Review.objects.count(), 0)
 
     
@@ -1173,6 +1176,7 @@ class ReviewEndpointTests(APITestCase):
         with patch(
             "work_review.views.get_assignment",
             return_value={
+                "status": "completed",
                 "assignment_id": str(self.assignment_id),
                 "student_id": str(self.reviewee_id),
                 "project_id": str(uuid.uuid4()),
@@ -1234,6 +1238,7 @@ class ReviewEndpointTests(APITestCase):
             with patch(
                 "work_review.views.get_assignment",
                 return_value={
+                    "status": "completed",
                     "assignment_id": str(self.assignment_id),
                     "student_id": str(self.reviewer_id),
                     "project_id": str(uuid.uuid4()),
@@ -1253,7 +1258,7 @@ class ReviewEndpointTests(APITestCase):
                 response.status_code,
                 status.HTTP_400_BAD_REQUEST,
             )
-            self.assertIn("assignment_id", response.data["details"])
+            self.assertIn("assignment_id", response.data["details"]["fields"])
 
 
 class SubmitWorkEndpointTests(APITestCase):
@@ -1423,7 +1428,7 @@ class SubmitWorkEndpointTests(APITestCase):
         )
         self.assertEqual(
             response.data["code"],
-            "INVALID_WORK_STATUS",
+            "INVALID_STATE_TRANSITION",
         )
         self.assertIn("error", response.data)
         self.assertIn("details", response.data)
@@ -1583,7 +1588,7 @@ class RequestRevisionEndpointTests(APITestCase):
         )
         self.assertEqual(
             response.data["code"],
-            "SERVICE_UNAVAILABLE",
+            "UPSTREAM_SERVICE_ERROR",
         )
         mock_get_assignment.assert_called_once()
     
@@ -1652,6 +1657,15 @@ class RequestRevisionEndpointTests(APITestCase):
 class ApproveWorkEndpointTests(APITestCase):
     def setUp(self):
         from rest_framework.test import APIRequestFactory, force_authenticate
+
+        for name, value in (
+            ("find_assignment_payment", None),
+            ("complete_project", {}),
+            ("complete_assignment", {}),
+        ):
+            patcher = patch(f"work_review.views.{name}", return_value=value)
+            setattr(self, f"mock_{name}", patcher.start())
+            self.addCleanup(patcher.stop)
 
         self.student_id = uuid.uuid4()
         self.client_id = uuid.uuid4()
@@ -1971,7 +1985,7 @@ class WorkDetailEndpointTests(APITestCase):
             response.status_code,
             status.HTTP_400_BAD_REQUEST,
         )
-        self.assertIn("non_field_errors", response.data["details"])
+        self.assertIn("non_field_errors", response.data["details"]["fields"])
 
     def test_another_student_cannot_retrieve_work(self):
         from rest_framework import status
@@ -2037,3 +2051,245 @@ class WorkDetailEndpointTests(APITestCase):
             serializer.is_valid(raise_exception=True)
 
         self.assertIn("project_id", context.exception.detail)
+
+
+class IntegrationBehaviourTests(APITestCase):
+    """Client visibility, envelopes, approval reuse and review eligibility."""
+
+    def setUp(self):
+        self.student_id = uuid.uuid4()
+        self.client_id = uuid.uuid4()
+        self.assignment_id = uuid.uuid4()
+        self.project_id = uuid.uuid4()
+        self.work = Deliverable.objects.create(
+            assignment_id=self.assignment_id,
+            student_id=self.student_id,
+            project_id=self.project_id,
+            title="Landing page",
+            submission_url="https://example.com/work",
+            status=Deliverable.Status.SUBMITTED,
+        )
+        self.assignment = {
+            "id": str(self.assignment_id),
+            "student_id": str(self.student_id),
+            "client_id": str(self.client_id),
+            "project_id": str(self.project_id),
+            "status": "active",
+        }
+        self.factory = APIRequestFactory()
+
+    def as_user(self, request, user_id, role):
+        from rest_framework.test import force_authenticate
+
+        user = type(
+            "TestUser",
+            (),
+            {"user_id": user_id, "role": role, "is_authenticated": True},
+        )()
+        force_authenticate(request, user=user, token="token")
+        return request
+
+    def test_client_lists_work_for_owned_assignment(self):
+        from work_review.views import WorkListCreateView
+
+        request = self.as_user(
+            self.factory.get(f"/api/work/?assignment_id={self.assignment_id}"),
+            self.client_id,
+            "CLIENT",
+        )
+        with patch("work_review.views.get_assignment", return_value=self.assignment):
+            response = WorkListCreateView.as_view()(request)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([w["id"] for w in response.data["data"]], [str(self.work.id)])
+        self.assertEqual(response.data["pagination"]["total"], 1)
+
+    def test_client_must_supply_assignment_id(self):
+        from work_review.views import WorkListCreateView
+
+        request = self.as_user(self.factory.get("/api/work/"), self.client_id, "CLIENT")
+        response = WorkListCreateView.as_view()(request)
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data["code"], "VALIDATION_ERROR")
+
+    def test_other_client_cannot_list_assignment_work(self):
+        from work_review.views import WorkListCreateView
+
+        request = self.as_user(
+            self.factory.get(f"/api/work/?assignment_id={self.assignment_id}"),
+            uuid.uuid4(),
+            "CLIENT",
+        )
+        with patch("work_review.views.get_assignment", return_value=self.assignment):
+            response = WorkListCreateView.as_view()(request)
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.data["code"], "FORBIDDEN")
+
+    def test_client_retrieves_work_in_envelope(self):
+        from work_review.views import WorkDetailView
+
+        request = self.as_user(
+            self.factory.get(f"/api/work/{self.work.id}/"), self.client_id, "CLIENT"
+        )
+        with patch("work_review.views.get_assignment", return_value=self.assignment):
+            response = WorkDetailView.as_view()(request, work_id=self.work.id)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["data"]["id"], str(self.work.id))
+        self.assertTrue(response.data["message"])
+
+    def test_client_cannot_edit_work(self):
+        from work_review.views import WorkDetailView
+
+        request = self.as_user(
+            self.factory.patch(f"/api/work/{self.work.id}/", {"title": "x"}, format="json"),
+            self.client_id,
+            "CLIENT",
+        )
+        with patch("work_review.views.get_assignment", return_value=self.assignment):
+            response = WorkDetailView.as_view()(request, work_id=self.work.id)
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_student_creates_work_with_envelope(self):
+        from work_review.views import WorkListCreateView
+
+        request = self.as_user(
+            self.factory.post(
+                "/api/work/",
+                {
+                    "assignment_id": str(self.assignment_id),
+                    "project_id": str(self.project_id),
+                    "title": "Draft",
+                },
+                format="json",
+            ),
+            self.student_id,
+            "STUDENT",
+        )
+        with patch("work_review.views.get_assignment", return_value=self.assignment):
+            response = WorkListCreateView.as_view()(request)
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data["data"]["status"], "DRAFT")
+        self.assertEqual(response.data["data"]["student_id"], str(self.student_id))
+        self.assertTrue(response.data["message"])
+
+    def test_empty_list_has_zero_total_pages(self):
+        from work_review.views import WorkListCreateView
+
+        request = self.as_user(self.factory.get("/api/work/"), uuid.uuid4(), "STUDENT")
+        response = WorkListCreateView.as_view()(request)
+
+        self.assertEqual(response.data["pagination"]["total_pages"], 0)
+
+    @patch("work_review.views.complete_assignment")
+    @patch("work_review.views.complete_project")
+    @patch("work_review.views.release_payment_request")
+    @patch("work_review.views.process_payment_request")
+    @patch("work_review.views.post_payment_request")
+    @patch("work_review.views.find_assignment_payment")
+    @patch("work_review.views.verify_client_ownership")
+    def test_approval_releases_existing_processed_payment(
+        self,
+        mock_ownership,
+        mock_find,
+        mock_create,
+        mock_process,
+        mock_release,
+        mock_complete_project,
+        mock_complete_assignment,
+    ):
+        from work_review.views import ApproveWorkView
+
+        mock_ownership.return_value = (
+            self.assignment,
+            {"client_id": str(self.client_id), "budget": "750.00"},
+        )
+        payment_id = str(uuid.uuid4())
+        mock_find.return_value = {"id": payment_id, "status": "SUCCESS"}
+        mock_release.return_value = {"data": {"id": payment_id, "status": "RELEASED"}}
+
+        request = self.as_user(
+            self.factory.post(f"/api/work/{self.work.id}/approve/", {}, format="json"),
+            self.client_id,
+            "CLIENT",
+        )
+        response = ApproveWorkView.as_view()(request, work_id=self.work.id)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["data"]["status"], "APPROVED")
+        self.assertEqual(response.data["data"]["payment"]["status"], "RELEASED")
+        mock_create.assert_not_called()
+        mock_process.assert_not_called()
+        mock_release.assert_called_once_with(payment_id, "token")
+        mock_complete_project.assert_called_once()
+        mock_complete_assignment.assert_called_once()
+
+    @patch("work_review.views.complete_assignment")
+    @patch("work_review.views.complete_project")
+    @patch("work_review.views.find_assignment_payment")
+    @patch("work_review.views.verify_client_ownership")
+    def test_completion_failure_leaves_work_submitted(
+        self, mock_ownership, mock_find, mock_complete_project, mock_complete_assignment
+    ):
+        from work_review.views import ApproveWorkView
+
+        mock_ownership.return_value = (
+            self.assignment,
+            {"client_id": str(self.client_id), "budget": "750.00"},
+        )
+        mock_find.return_value = {"id": str(uuid.uuid4()), "status": "RELEASED"}
+        mock_complete_project.side_effect = ProjectServiceUnavailableError("down")
+
+        request = self.as_user(
+            self.factory.post(f"/api/work/{self.work.id}/approve/", {}, format="json"),
+            self.client_id,
+            "CLIENT",
+        )
+        response = ApproveWorkView.as_view()(request, work_id=self.work.id)
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.data["code"], "UPSTREAM_SERVICE_ERROR")
+        self.work.refresh_from_db()
+        self.assertEqual(self.work.status, Deliverable.Status.SUBMITTED)
+
+    def test_review_requires_completed_assignment(self):
+        from work_review.views import ReviewListCreateView
+
+        request = self.as_user(
+            self.factory.post(
+                "/api/reviews/",
+                {
+                    "assignment_id": str(self.assignment_id),
+                    "reviewee_id": str(self.student_id),
+                    "rating": 4,
+                },
+                format="json",
+            ),
+            self.client_id,
+            "CLIENT",
+        )
+        with patch(
+            "work_review.views.get_assignment", return_value=self.assignment
+        ), patch(
+            "work_review.views.get_project",
+            return_value={"client_id": str(self.client_id), "budget": "750.00"},
+        ):
+            response = ReviewListCreateView.as_view()(request)
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("assignment_id", response.data["details"]["fields"])
+        self.assertFalse(Review.objects.exists())
+
+    def test_health_uses_envelope(self):
+        response = self.client.get("/api/health/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["data"]["status"], "healthy")
+
+    def test_unknown_route_returns_json_404(self):
+        response = self.client.get("/api/nothing-here/")
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json()["code"], "NOT_FOUND")
