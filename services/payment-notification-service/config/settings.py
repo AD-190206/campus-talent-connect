@@ -3,10 +3,20 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "development-only-secret")
-DEBUG = os.getenv("DJANGO_DEBUG", "1") == "1"
+SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "")
+if not SECRET_KEY:
+    raise RuntimeError("DJANGO_SECRET_KEY must be configured.")
 
-ALLOWED_HOSTS = ["*"]
+DEBUG = os.getenv("DJANGO_DEBUG", "0") == "1"
+
+ALLOWED_HOSTS = [
+    host.strip()
+    for host in os.getenv(
+        "DJANGO_ALLOWED_HOSTS",
+        "localhost,127.0.0.1,payment-notification-service",
+    ).split(",")
+    if host.strip()
+]
 
 INSTALLED_APPS = [
     "django.contrib.admin",
@@ -23,6 +33,7 @@ INSTALLED_APPS = [
 MIDDLEWARE = [
     "corsheaders.middleware.CorsMiddleware",
     "django.middleware.security.SecurityMiddleware",
+    "django.middleware.clickjacking.XFrameOptionsMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
@@ -71,10 +82,51 @@ USE_TZ = True
 STATIC_URL = "static/"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
-CORS_ALLOW_ALL_ORIGINS = True
+CORS_ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv(
+        "CORS_ALLOWED_ORIGINS",
+        "http://localhost:3000",
+    ).split(",")
+    if origin.strip()
+]
+
 
 REST_FRAMEWORK = {
-    "DEFAULT_PERMISSION_CLASSES": [
-        "rest_framework.permissions.AllowAny",
+    "DEFAULT_AUTHENTICATION_CLASSES": [
+        "payments_notifications.authentication.JWTAuthentication",
     ],
+    "DEFAULT_PERMISSION_CLASSES": [
+        "rest_framework.permissions.IsAuthenticated",
+    ],
+    "COERCE_DECIMAL_TO_STRING": True,
 }
+# Upstream service configuration
+PROJECT_SERVICE_URL = os.getenv(
+    "PROJECT_SERVICE_URL",
+    "http://project-service:8002",
+).rstrip("/")
+
+APPLICATION_SERVICE_URL = os.getenv(
+    "APPLICATION_SERVICE_URL",
+    "http://application-service:8003",
+).rstrip("/")
+
+WORK_REVIEW_SERVICE_URL = os.getenv(
+    "WORK_REVIEW_SERVICE_URL",
+    "http://work-review-service:8004",
+).rstrip("/")
+
+# Timeout values for upstream HTTP requests, in seconds
+UPSTREAM_CONNECT_TIMEOUT = float(
+    os.getenv("UPSTREAM_CONNECT_TIMEOUT", "3")
+)
+UPSTREAM_READ_TIMEOUT = float(
+    os.getenv("UPSTREAM_READ_TIMEOUT", "5")
+)
+
+# Mock payment processing must be explicitly enabled.
+# Keep it disabled by default.
+MOCK_PAYMENT_ENABLED = os.getenv(
+    "MOCK_PAYMENT_ENABLED", "0"
+) == "1"
