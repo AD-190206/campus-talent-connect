@@ -1,7 +1,10 @@
-﻿from django.utils import timezone
+﻿import uuid
+from decimal import Decimal, InvalidOperation
+
+from django.utils import timezone
 from django.db import IntegrityError, models, transaction
 from rest_framework import generics, status
-from rest_framework.exceptions import PermissionDenied, ValidationError
+from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -9,12 +12,14 @@ from .exceptions import ServiceUnavailable
 from .models import Deliverable, Review
 from .serializers import DeliverableSerializer, ReviewSerializer
 from .project_client import (
+    complete_project,
     get_project,
     ProjectNotFoundError,
     ProjectAuthorizationError,
     ProjectServiceUnavailableError,
 )
 from .assignment_client import (
+    complete_assignment,
     get_assignment,
     AssignmentNotFoundError,
     AssignmentAuthorizationError,
@@ -22,6 +27,7 @@ from .assignment_client import (
 )
 
 from .payment_client import (
+    find_assignment_payment,
     post_payment_request,
     process_payment_request,
     release_payment_request,
@@ -29,14 +35,59 @@ from .payment_client import (
     PaymentServiceUnavailableError,
 )
 
+
+def envelope(data, message, http_status=status.HTTP_200_OK):
+    return Response({"data": data, "message": message}, status=http_status)
+
+
+def uuid_query_param(request, name):
+    raw = request.query_params.get(name)
+    if not raw:
+        return None
+    try:
+        return uuid.UUID(raw)
+    except ValueError:
+        raise ValidationError({name: "Must be a valid UUID."})
+
+
+def fetch_assignment(assignment_id, request):
+    """Fetch an assignment, translating client errors into API errors."""
+    try:
+        return get_assignment(
+            assignment_id=assignment_id,
+            access_token=request.auth,
+        )
+    except AssignmentNotFoundError:
+        raise NotFound("Assignment not found.")
+    except AssignmentAuthorizationError:
+        raise PermissionDenied("Assignment access was denied.")
+    except AssignmentServiceUnavailableError:
+        raise ServiceUnavailable(
+            "Assignment Service is temporarily unavailable."
+        )
+
+
+def require_assignment_client(assignment_id, request):
+    """The caller must be the client recorded on the assignment."""
+    assignment = fetch_assignment(assignment_id, request)
+
+    if str(assignment.get("client_id")) != str(request.user.user_id):
+        raise PermissionDenied(
+            "You are not the client for this assignment."
+        )
+
+    return assignment
+
+
 class HealthView(APIView):
+    authentication_classes = []
     permission_classes = [AllowAny]
 
     def get(self, request):
-        return Response({
-            "service": "work-review-service",
-            "status": "running",
-        })
+        return envelope(
+            {"service": "work-review-service", "status": "healthy"},
+            "Health check successful",
+        )
 
 
 class WorkListCreateView(generics.ListCreateAPIView):
@@ -44,18 +95,46 @@ class WorkListCreateView(generics.ListCreateAPIView):
     serializer_class = DeliverableSerializer
 
     def get_queryset(self):
+        """
+        STUDENT: own deliverables.
+        CLIENT:  deliverables of one assignment they own (assignment_id required).
+        ADMIN:   everything.
+        Optional filters: assignment_id, status.
+        """
         user = self.request.user
+        assignment_id = uuid_query_param(self.request, "assignment_id")
 
         if user.role == "STUDENT":
-            return Deliverable.objects.filter(student_id=user.user_id)
+            queryset = Deliverable.objects.filter(student_id=user.user_id)
+        elif user.role == "ADMIN":
+            queryset = Deliverable.objects.all()
+        elif user.role == "CLIENT":
+            if not assignment_id:
+                raise ValidationError(
+                    {"assignment_id": "This parameter is required for clients."}
+                )
+            require_assignment_client(assignment_id, self.request)
+            queryset = Deliverable.objects.all()
+        else:
+            queryset = Deliverable.objects.none()
 
-        if user.role == "ADMIN":
-            return Deliverable.objects.all()
+        if assignment_id:
+            queryset = queryset.filter(assignment_id=assignment_id)
 
-        # Client access will be added after assignment ownership validation.
-        return Deliverable.objects.none()
+        work_status = self.request.query_params.get("status")
+        if work_status:
+            queryset = queryset.filter(status=work_status)
 
-    
+        return queryset
+
+    def create(self, request, *args, **kwargs):
+        response = super().create(request, *args, **kwargs)
+        return envelope(
+            response.data,
+            "Work created successfully.",
+            status.HTTP_201_CREATED,
+        )
+
     def perform_create(self, serializer):
         user = self.request.user
 
@@ -65,25 +144,7 @@ class WorkListCreateView(generics.ListCreateAPIView):
             )
 
         assignment_id = serializer.validated_data["assignment_id"]
-        access_token = self.request.auth
-
-        try:
-            assignment = get_assignment(
-                assignment_id=assignment_id,
-                access_token=access_token,
-            )
-        except AssignmentNotFoundError:
-            from rest_framework.exceptions import NotFound
-
-            raise NotFound("Assignment not found.")
-        except AssignmentAuthorizationError:
-            raise PermissionDenied(
-                "Assignment access was denied."
-            )
-        except AssignmentServiceUnavailableError:
-            raise ServiceUnavailable(
-                "Assignment Service is temporarily unavailable."
-            )
+        assignment = fetch_assignment(assignment_id, self.request)
 
         assigned_student_id = assignment.get("student_id")
 
@@ -92,11 +153,15 @@ class WorkListCreateView(generics.ListCreateAPIView):
                 "You are not the student assigned to this assignment."
             )
 
+        if assignment.get("status", "active") != "active":
+            raise ValidationError(
+                {"assignment_id": "Work can only be added to an active assignment."}
+            )
+
         serializer.save(
             student_id=user.user_id,
             project_id=assignment["project_id"],
         )
-
 
 
 class WorkDetailView(generics.RetrieveUpdateAPIView):
@@ -111,10 +176,30 @@ class WorkDetailView(generics.RetrieveUpdateAPIView):
         if user.role == "STUDENT":
             return Deliverable.objects.filter(student_id=user.user_id)
 
-        if user.role == "ADMIN":
+        # Clients are checked against the assignment in get_object().
+        if user.role in {"ADMIN", "CLIENT"}:
             return Deliverable.objects.all()
 
         return Deliverable.objects.none()
+
+    def get_object(self):
+        work = super().get_object()
+
+        if self.request.user.role == "CLIENT":
+            require_assignment_client(work.assignment_id, self.request)
+
+        return work
+
+    def retrieve(self, request, *args, **kwargs):
+        response = super().retrieve(request, *args, **kwargs)
+        return envelope(response.data, "Work retrieved successfully.")
+
+    def update(self, request, *args, **kwargs):
+        if request.user.role != "STUDENT":
+            raise PermissionDenied("Only the assigned student can edit work.")
+
+        response = super().update(request, *args, **kwargs)
+        return envelope(response.data, "Work updated successfully.")
 
 
 class SubmitWorkView(APIView):
@@ -124,10 +209,7 @@ class SubmitWorkView(APIView):
         try:
             work = Deliverable.objects.get(id=work_id)
         except Deliverable.DoesNotExist:
-            return Response(
-                {"error": "Work record not found.", "code": "WORK_NOT_FOUND", "details": {}},
-                status=status.HTTP_404_NOT_FOUND,
-            )
+            raise NotFound("Work record not found.")
 
         if (request.user.role != "STUDENT" or str(work.student_id) != str(request.user.user_id)):
             raise PermissionDenied("You cannot submit this work record.")
@@ -139,7 +221,7 @@ class SubmitWorkView(APIView):
             return Response(
                 {
                     "error": "Only draft work or work requiring revisions can be submitted.",
-                    "code": "INVALID_WORK_STATUS",
+                    "code": "INVALID_STATE_TRANSITION",
                     "details": {},
                 },
                 status=status.HTTP_400_BAD_REQUEST,
@@ -159,10 +241,10 @@ class SubmitWorkView(APIView):
         work.submitted_at = timezone.now()
         work.save(update_fields=["status", "submitted_at", "updated_at"])
 
-        return Response({
-            "data": DeliverableSerializer(work).data,
-            "message": "Work submitted successfully.",
-        })
+        return envelope(
+            DeliverableSerializer(work).data,
+            "Work submitted successfully.",
+        )
 
 
 def verify_client_ownership(work, request):
@@ -188,8 +270,6 @@ def verify_client_ownership(work, request):
         )
 
     except (AssignmentNotFoundError, ProjectNotFoundError):
-        from rest_framework.exceptions import NotFound
-
         raise NotFound("The assignment or project was not found.")
     except (AssignmentAuthorizationError, ProjectAuthorizationError):
         raise PermissionDenied(
@@ -235,8 +315,6 @@ def verify_review_eligibility(assignment_id, reviewee_id, request):
         )
 
     except (AssignmentNotFoundError, ProjectNotFoundError):
-        from rest_framework.exceptions import NotFound
-
         raise NotFound("The assignment or project was not found.")
     except (AssignmentAuthorizationError, ProjectAuthorizationError):
         raise PermissionDenied(
@@ -286,17 +364,23 @@ def verify_review_eligibility(assignment_id, reviewee_id, request):
                 )
             })
 
+    # Reviews are given once the work has been approved and the assignment
+    # completed (SRS: reviews follow completion).
+    if assignment.get("status") != "completed":
+        raise ValidationError({
+            "assignment_id": (
+                "Reviews can only be submitted for a completed assignment."
+            )
+        })
+
 
 class RequestRevisionView(APIView):
     permission_classes = [IsAuthenticated]
 
-    
     def post(self, request, work_id):
         try:
             work = Deliverable.objects.get(id=work_id)
         except Deliverable.DoesNotExist:
-            from rest_framework.exceptions import NotFound
-
             raise NotFound("Work record not found.")
 
         if request.user.role != "CLIENT":
@@ -329,21 +413,29 @@ class RequestRevisionView(APIView):
             ]
         )
 
-        return Response({
-            "data": DeliverableSerializer(work).data,
-            "message": "Revision requested successfully.",
-        })
-
-
+        return envelope(
+            DeliverableSerializer(work).data,
+            "Revision requested successfully.",
+        )
 
 
 class ApproveWorkView(APIView):
+    """
+    Approve a deliverable (API contract §9.2).
+
+    1. Verify the caller owns the project/assignment.
+    2. Reuse the assignment's existing payment, or create one from the
+       project budget with a stable idempotency key.
+    3. Process it (mock provider) if still pending, then release it.
+    4. Complete the project and the assignment.
+    5. Only then mark the work APPROVED.
+
+    Every step is idempotent, so a failed approval can simply be retried.
+    """
+
     permission_classes = [IsAuthenticated]
 
     def post(self, request, work_id):
-        from decimal import Decimal, InvalidOperation
-        from rest_framework.exceptions import NotFound
-
         try:
             work = Deliverable.objects.get(id=work_id)
         except Deliverable.DoesNotExist:
@@ -355,6 +447,12 @@ class ApproveWorkView(APIView):
             )
 
         assignment, project = verify_client_ownership(work, request)
+
+        if work.status == Deliverable.Status.APPROVED:
+            return envelope(
+                DeliverableSerializer(work).data,
+                "Work has already been approved.",
+            )
 
         if work.status != Deliverable.Status.SUBMITTED:
             raise ValidationError(
@@ -375,57 +473,51 @@ class ApproveWorkView(APIView):
             )
 
         assignment_id = str(work.assignment_id)
-        payment_payload = {
-            "assignment_id": assignment_id,
-            "payer_id": str(request.user.user_id),
-            "payee_id": str(work.student_id),
-            "amount": str(amount),
-            "idempotency_key": f"work-review-assignment-{assignment_id}",
-        }
         access_token = request.auth
 
         try:
-            # A stable key lets a retry reuse the payment request.
-            payment_response = post_payment_request(
-                "api/payments/",
-                payment_payload,
-                access_token,
-            )
-            payment = payment_response["data"]
+            payment = find_assignment_payment(assignment_id, access_token)
+
+            if payment is None:
+                # A stable key lets a retry reuse the payment request.
+                payment = post_payment_request(
+                    "api/payments/",
+                    {
+                        "assignment_id": assignment_id,
+                        "payer_id": str(request.user.user_id),
+                        "payee_id": str(work.student_id),
+                        "amount": str(amount),
+                        "idempotency_key": (
+                            f"work-review-assignment-{assignment_id}"
+                        ),
+                    },
+                    access_token,
+                )["data"]
+
             payment_id = payment["id"]
 
-            # A previously released payment needs no further processing.
+            if payment.get("status") in {"PENDING", "PROCESSING"}:
+                payment = process_payment_request(
+                    payment_id,
+                    access_token,
+                )["data"]
+
+            if payment.get("status") == "FAILED":
+                raise ValidationError(
+                    "Payment processing failed; work has not been approved."
+                )
+
+            if payment.get("status") == "SUCCESS":
+                payment = release_payment_request(
+                    payment_id,
+                    access_token,
+                )["data"]
+
             if payment.get("status") != "RELEASED":
-                if payment.get("status") != "SUCCESS":
-                    processed_response = process_payment_request(
-                        payment_id,
-                        access_token,
-                    )
-                    payment = processed_response["data"]
-
-                if payment.get("status") == "FAILED":
-                    raise ValidationError(
-                        "Payment processing failed; work has not been approved."
-                    )
-
-                if payment.get("status") not in {"SUCCESS", "RELEASED"}:
-                    raise ServiceUnavailable(
-                        "Payment has not reached a successful state; "
-                        "work has not been approved."
-                    )
-
-                if payment.get("status") != "RELEASED":
-                    released_response = release_payment_request(
-                        payment_id,
-                        access_token,
-                    )
-                    payment = released_response["data"]
-
-                if payment.get("status") != "RELEASED":
-                    raise ServiceUnavailable(
-                        "Payment release could not be confirmed; "
-                        "work has not been approved."
-                    )
+                raise ServiceUnavailable(
+                    "Payment release could not be confirmed; "
+                    "work has not been approved."
+                )
 
         except PaymentServiceAuthorizationError:
             raise PermissionDenied(
@@ -436,7 +528,25 @@ class ApproveWorkView(APIView):
                 "The Payment Service is temporarily unavailable."
             )
 
-        # Only mark the work approved after release is confirmed.
+        try:
+            complete_project(work.project_id, access_token)
+            complete_assignment(work.assignment_id, access_token)
+        except (ProjectNotFoundError, AssignmentNotFoundError):
+            raise NotFound("The assignment or project was not found.")
+        except (ProjectAuthorizationError, AssignmentAuthorizationError):
+            raise PermissionDenied(
+                "Completion was denied by a required service."
+            )
+        except (
+            ProjectServiceUnavailableError,
+            AssignmentServiceUnavailableError,
+        ):
+            raise ServiceUnavailable(
+                "Payment was released but completion could not be recorded; "
+                "retry the approval."
+            )
+
+        # Only mark the work approved after release and completion succeed.
         with transaction.atomic():
             locked_work = Deliverable.objects.select_for_update().get(
                 id=work.id
@@ -444,10 +554,10 @@ class ApproveWorkView(APIView):
 
             # Re-check state after acquiring the lock.
             if locked_work.status == Deliverable.Status.APPROVED:
-                return Response({
-                    "data": DeliverableSerializer(locked_work).data,
-                    "message": "Work has already been approved.",
-                })
+                return envelope(
+                    DeliverableSerializer(locked_work).data,
+                    "Work has already been approved.",
+                )
 
             if locked_work.status != Deliverable.Status.SUBMITTED:
                 raise ValidationError(
@@ -467,7 +577,13 @@ class ApproveWorkView(APIView):
             )
 
         return Response({
-            "data": DeliverableSerializer(locked_work).data,
+            "data": {
+                **DeliverableSerializer(locked_work).data,
+                "payment": {
+                    "id": payment["id"],
+                    "status": payment.get("status"),
+                },
+            },
             "message": "Work approved and payment released successfully.",
         })
 
@@ -480,11 +596,25 @@ class ReviewListCreateView(generics.ListCreateAPIView):
         user = self.request.user
 
         if user.role == "ADMIN":
-            return Review.objects.all()
+            queryset = Review.objects.all()
+        else:
+            queryset = Review.objects.filter(
+                models.Q(reviewer_id=user.user_id)
+                | models.Q(reviewee_id=user.user_id)
+            )
 
-        return Review.objects.filter(
-            models.Q(reviewer_id=user.user_id)
-            | models.Q(reviewee_id=user.user_id)
+        assignment_id = uuid_query_param(self.request, "assignment_id")
+        if assignment_id:
+            queryset = queryset.filter(assignment_id=assignment_id)
+
+        return queryset
+
+    def create(self, request, *args, **kwargs):
+        response = super().create(request, *args, **kwargs)
+        return envelope(
+            response.data,
+            "Review submitted successfully.",
+            status.HTTP_201_CREATED,
         )
 
     def perform_create(self, serializer):
@@ -495,7 +625,6 @@ class ReviewListCreateView(generics.ListCreateAPIView):
                 "Only students and clients can create reviews."
             )
 
-        
         assignment_id = serializer.validated_data["assignment_id"]
         reviewee_id = serializer.validated_data["reviewee_id"]
 
@@ -557,3 +686,7 @@ class ReviewDetailView(generics.RetrieveAPIView):
             models.Q(reviewer_id=user.user_id)
             | models.Q(reviewee_id=user.user_id)
         )
+
+    def retrieve(self, request, *args, **kwargs):
+        response = super().retrieve(request, *args, **kwargs)
+        return envelope(response.data, "Review retrieved successfully.")

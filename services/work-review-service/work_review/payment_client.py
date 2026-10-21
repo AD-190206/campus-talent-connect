@@ -100,3 +100,69 @@ def release_payment_request(payment_id, access_token):
         {},
         access_token,
     )
+
+
+# Payments in these statuses no longer count as the assignment's payment.
+INACTIVE_PAYMENT_STATUSES = {"FAILED", "REFUNDED"}
+
+
+def find_assignment_payment(assignment_id, access_token):
+    """Return the caller's active payment for an assignment, or None.
+
+    The client may already have created (and processed) the payment before
+    approval, as described in the contract's payment workflow.
+    """
+    base_url = os.getenv("PAYMENT_SERVICE_URL", "").rstrip("/")
+
+    if not base_url:
+        raise PaymentServiceUnavailableError(
+            "Payment Service URL is not configured."
+        )
+
+    if not access_token:
+        raise PaymentServiceAuthorizationError(
+            "An authenticated access token is required."
+        )
+
+    try:
+        response = requests.get(
+            f"{base_url}/api/payments/",
+            params={"assignment_id": str(assignment_id), "page_size": 100},
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=3,
+        )
+    except requests.RequestException as exc:
+        raise PaymentServiceUnavailableError(
+            "Could not reach the Payment Service."
+        ) from exc
+
+    if response.status_code in {401, 403}:
+        raise PaymentServiceAuthorizationError(
+            "Payment Service rejected the caller's credentials."
+        )
+
+    if response.status_code != 200:
+        raise PaymentServiceUnavailableError(
+            f"Payment Service returned HTTP {response.status_code}."
+        )
+
+    try:
+        payments = response.json().get("data")
+    except (ValueError, AttributeError) as exc:
+        raise PaymentServiceUnavailableError(
+            "Payment Service returned invalid JSON."
+        ) from exc
+
+    if not isinstance(payments, list):
+        raise PaymentServiceUnavailableError(
+            "Payment Service returned an invalid response envelope."
+        )
+
+    for payment in payments:
+        if (
+            isinstance(payment, dict)
+            and payment.get("status") not in INACTIVE_PAYMENT_STATUSES
+        ):
+            return payment
+
+    return None

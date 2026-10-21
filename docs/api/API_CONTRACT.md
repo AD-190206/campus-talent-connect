@@ -382,3 +382,57 @@ These decisions are authoritative for the current implementation and should not 
 12. **Production security:** no development secret fallback in production; debug off; explicit hosts/CORS; secrets are not committed.
 
 The migration must be coordinated across services. No service should be treated as integration-ready while its IDs, authentication, responses, or workflow violate these decisions.
+
+## 14. Revision 1 — integration additions (2026-10-21)
+
+These additions were needed to run the §9 workflow end to end. They extend the catalogue without changing any existing route, envelope or decision in §13. `scripts/e2e_test.py` exercises all of them.
+
+### 14.1 Project lifecycle (Project service)
+
+| Method | Route | Access | Purpose |
+|---|---|---|---|
+| POST | `/api/projects/{project_id}/start/` | Owning client | `PUBLISHED` → `IN_PROGRESS`. Called by the Application service when an applicant is selected (client token forwarded). Idempotent. |
+| POST | `/api/projects/{project_id}/complete/` | Owning client | `IN_PROGRESS` → `COMPLETED`. Called by Work & Review on approval. Idempotent. |
+
+Allowed transitions: `DRAFT → PUBLISHED | CLOSED`, `PUBLISHED → IN_PROGRESS | CLOSED`, `IN_PROGRESS → COMPLETED | CLOSED`. `ARCHIVED` is reserved. Projects can be edited only while `DRAFT` or `PUBLISHED`, so the budget is frozen once work starts.
+
+### 14.2 Applications and assignments (Application service)
+
+| Method | Route | Access | Purpose |
+|---|---|---|---|
+| POST | `/api/assignments/{assignment_id}/complete/` | Assignment's client | `active` → `completed`, sets `completion_date`. Called by Work & Review on approval. Idempotent. |
+
+- `GET /api/applications/`: students see only their own applications; clients must pass `project_id` for a project they own; admins may filter freely. Optional `status` filter.
+- `POST /api/applications/` accepts only `project_id`, `proposal`, `resume_url`; any other field (including `student_id`) is a `400 VALIDATION_ERROR`.
+- Application transitions: `submitted → shortlisted | rejected | withdrawn`, `shortlisted → selected | rejected | withdrawn`. Proposals are editable only while `submitted`.
+- A project has exactly one assignment (database constraint). Selecting an applicant, in one transaction: marks it `selected`, creates the assignment, rejects the project's other open applications and starts the project. If starting the project fails, everything rolls back.
+- `GET /api/assignments/` returns only assignments where the caller is the student or client (admins see all). Optional `project_id` and `status` filters.
+
+### 14.3 Work & Review
+
+- `GET /api/work/`: students see their own deliverables; clients must pass `assignment_id` for an assignment they own; admins see all. Optional `assignment_id` and `status` filters. Clients may also `GET /api/work/{work_id}/` for their assignments; only the student may edit.
+- Work can only be created for an `active` assignment.
+- `POST /api/work/{work_id}/approve/`:
+  1. reuses the client's active payment for the assignment (`GET /api/payments/?assignment_id=`) or creates one with idempotency key `work-review-assignment-{assignment_id}`;
+  2. processes it if still `PENDING`/`PROCESSING`, then releases it;
+  3. completes the project and the assignment;
+  4. only then marks the work `APPROVED`.
+
+  Every step is idempotent, so a failed approval (for example `503 UPSTREAM_SERVICE_ERROR`) can be retried safely. The response includes `data.payment` (`id`, `status`).
+- `POST /api/reviews/` requires the assignment to be `completed`. `GET /api/reviews/` lists reviews the caller wrote or received (optional `assignment_id` filter).
+
+### 14.4 Payments and notifications
+
+- `GET /api/payments/` and `/api/payments/history/` accept optional `assignment_id` and `status` filters (results are always limited to the caller's payments).
+- At most one active payment (any status other than `FAILED`/`REFUNDED`) per assignment. A second one returns `409 CONFLICT` with `details.payment_id`.
+- `amount` in the request body is ignored; the amount is always the project budget.
+- Payment responses include `fee` (currently always `0.00`), `net_amount` (`amount - fee`) and `payment_mode` (`"MOCK"`).
+- Release eligibility: the payment must be `SUCCESS`, the caller must be the payer who owns the project, the payee must be the assigned student, **and** the assignment must have at least one `SUBMITTED` or `APPROVED` deliverable (checked with Work & Review). Otherwise `409 PAYMENT_RELEASE_NOT_ALLOWED`.
+- Releasing creates `PAYMENT_RELEASED` notifications for the payee and payer.
+- Processing while no provider is configured returns `503 PAYMENT_PROVIDER_UNAVAILABLE`. Set `MOCK_PAYMENT_ENABLED=1` (the default in `.env.example`) for development.
+
+### 14.5 Platform-wide
+
+- All services return UTC timestamps ending in `Z`.
+- Unknown routes and unreachable services return the error envelope (`NOT_FOUND`, `UPSTREAM_SERVICE_ERROR`) from both the services and the gateway. The gateway accepts collection roots without the trailing slash (`/api/projects` is served as `/api/projects/`); deeper routes must use the trailing slash shown in §8.
+- Upstream failures from service-to-service calls use `502`/`503`/`504` with `UPSTREAM_SERVICE_ERROR` (or the more specific `UPSTREAM_*` codes in the Payment service).

@@ -1,81 +1,132 @@
-﻿from rest_framework.views import APIView
-from rest_framework.response import Response
-from rest_framework import status
-from rest_framework.exceptions import PermissionDenied
-import math
+﻿"""Application & Assignment endpoints (API contract §8.3).
 
+Identity always comes from the validated JWT. Client ownership of a project
+is verified with the Project service, forwarding the caller's token.
+"""
+import uuid
+
+from django.db.models import Q
+from django.shortcuts import get_object_or_404
+from rest_framework import status
+from rest_framework.permissions import AllowAny
+from rest_framework.views import APIView
+
+from . import services
+from .api import ApiError, paginated, success
+from .models import Application, Assignment
+from .project_client import get_project, start_project
 from .serializers import (
     ApplicationCreateSerializer,
-    ApplicationListSerializer,
+    ApplicationSerializer,
     ApplicationUpdateSerializer,
     AssignmentSerializer,
 )
-from .services import (
-    DuplicateApplicationError,
-    create_application,
-    update_application,
-    get_applications_for_project,
-    get_applications_for_student,
-    get_application_by_id,
-    shortlist_application,
-    select_application,
-    reject_application,
-    withdraw_application,
-    get_assignment_by_id,
-    get_assignments_for_project,
-    get_all_assignments,
-)
-from .project_client import get_project, update_project_status, ProjectServiceError
-from .models import Application
 
+
+# ---------------------------------------------------------------- helpers
 
 def require_role(request, *roles):
-    role = getattr(request, "user_role", None)
-    if role not in roles:
-        raise PermissionDenied(
-            f"Access denied. Required role: {', '.join(roles)}. Your role: {role or 'unauthenticated'}."
+    if request.user.role not in roles:
+        raise ApiError(
+            f"This action requires role: {', '.join(roles)}.",
+            "FORBIDDEN",
+            status.HTTP_403_FORBIDDEN,
         )
 
 
-def success(data, message, http_status=status.HTTP_200_OK):
-    return Response({"data": data, "message": message}, status=http_status)
+def auth_header(request):
+    return request.headers.get("Authorization", "")
 
 
-def error(message, code, details=None, http_status=status.HTTP_400_BAD_REQUEST):
-    return Response(
-        {"error": message, "code": code, "details": details or {}},
-        status=http_status,
+def uuid_param(request, name):
+    raw = request.query_params.get(name)
+    if raw is None or raw == "":
+        return None
+    try:
+        return uuid.UUID(raw)
+    except ValueError:
+        raise ApiError(
+            "Invalid query parameter.",
+            "VALIDATION_ERROR",
+            details={"fields": {name: ["Must be a valid UUID."]}},
+        )
+
+
+def is_applicant(request, application):
+    return (
+        request.user.role == "STUDENT"
+        and application.student_id == request.user.id
     )
 
 
-def paginate(queryset, serializer_class, request):
-    try:
-        page = int(request.query_params.get("page", 1))
-        page_size = int(request.query_params.get("page_size", 20))
-    except ValueError:
-        return None, error("page and page_size must be integers.", "VALIDATION_ERROR",
-                           http_status=status.HTTP_400_BAD_REQUEST)
-    if page < 1 or page_size < 1 or page_size > 100:
-        return None, error("page >= 1 and 1 <= page_size <= 100 required.", "VALIDATION_ERROR",
-                           http_status=status.HTTP_400_BAD_REQUEST)
-    total = queryset.count()
-    total_pages = math.ceil(total / page_size) if total > 0 else 0
-    items = queryset[(page - 1) * page_size: page * page_size]
-    serializer = serializer_class(items, many=True)
-    data = {
-        "data": serializer.data,
-        "message": "Resources retrieved successfully",
-        "pagination": {
-            "page": page,
-            "page_size": page_size,
-            "total": total,
-            "total_pages": total_pages,
-        },
-    }
-    return data, None
+def verify_project_owner(request, project_id):
+    """Return the project if the caller is the client who owns it."""
+    if request.user.role != "CLIENT":
+        raise ApiError(
+            "Only the client who owns the project can do this.",
+            "FORBIDDEN",
+            status.HTTP_403_FORBIDDEN,
+        )
 
+    project = get_project(project_id, auth_header(request))
+
+    if str(project.get("client_id")) != str(request.user.id):
+        raise ApiError(
+            "You do not own this project.",
+            "FORBIDDEN",
+            status.HTTP_403_FORBIDDEN,
+        )
+
+    return project
+
+
+def get_application_for_reader(request, pk):
+    """Applicant, owning client or admin may read an application."""
+    application = get_object_or_404(Application, id=pk)
+
+    if request.user.role == "ADMIN" or is_applicant(request, application):
+        return application
+
+    if request.user.role == "CLIENT":
+        verify_project_owner(request, application.project_id)
+        return application
+
+    raise ApiError(
+        "You cannot access this application.",
+        "FORBIDDEN",
+        status.HTTP_403_FORBIDDEN,
+    )
+
+
+def get_application_for_owner_client(request, pk):
+    application = get_object_or_404(Application, id=pk)
+    verify_project_owner(request, application.project_id)
+    return application
+
+
+def get_application_for_applicant(request, pk):
+    application = get_object_or_404(Application, id=pk)
+    if not is_applicant(request, application):
+        raise ApiError(
+            "Only the applicant can do this.",
+            "FORBIDDEN",
+            status.HTTP_403_FORBIDDEN,
+        )
+    return application
+
+
+def visible_assignments(user):
+    if user.role == "ADMIN":
+        return Assignment.objects.all()
+    return Assignment.objects.filter(Q(student_id=user.id) | Q(client_id=user.id))
+
+
+# ------------------------------------------------------------------ views
 
 class HealthView(APIView):
+    authentication_classes = []
+    permission_classes = [AllowAny]
+
     def get(self, request):
         return success(
             {"service": "application-service", "status": "healthy"},
@@ -85,210 +136,206 @@ class HealthView(APIView):
 
 class ApplicationListCreateView(APIView):
     def get(self, request):
-        project_id = request.query_params.get("project_id")
-        student_id = request.query_params.get("student_id")
+        """
+        STUDENT: own applications (optionally filtered by project_id).
+        CLIENT:  applications for a project they own (project_id required).
+        ADMIN:   any, optionally filtered by project_id / student_id.
+        """
+        project_id = uuid_param(request, "project_id")
+        student_id = uuid_param(request, "student_id")
+        role = request.user.role
+
+        if role == "STUDENT":
+            if student_id and student_id != request.user.id:
+                raise ApiError(
+                    "Students can only list their own applications.",
+                    "FORBIDDEN",
+                    status.HTTP_403_FORBIDDEN,
+                )
+            qs = Application.objects.filter(student_id=request.user.id)
+        elif role == "CLIENT":
+            if not project_id:
+                raise ApiError(
+                    "project_id is required for clients.",
+                    "VALIDATION_ERROR",
+                    details={"fields": {"project_id": ["This parameter is required."]}},
+                )
+            verify_project_owner(request, project_id)
+            qs = Application.objects.all()
+            if student_id:
+                qs = qs.filter(student_id=student_id)
+        else:
+            qs = Application.objects.all()
+            if student_id:
+                qs = qs.filter(student_id=student_id)
 
         if project_id:
-            qs = get_applications_for_project(project_id)
-        elif student_id:
-            qs = get_applications_for_student(student_id)
-        else:
-            return error(
-                "Provide either project_id or student_id as a query parameter.",
-                "VALIDATION_ERROR",
-            )
+            qs = qs.filter(project_id=project_id)
 
-        data, err = paginate(qs, ApplicationListSerializer, request)
-        if err:
-            return err
-        return Response(data, status=status.HTTP_200_OK)
+        app_status = request.query_params.get("status")
+        if app_status:
+            qs = qs.filter(status=app_status)
+
+        return paginated(
+            qs.order_by("-created_at", "id"),
+            ApplicationSerializer,
+            request.query_params,
+            "Applications retrieved successfully",
+        )
 
     def post(self, request):
         require_role(request, "STUDENT")
 
-        student_id = getattr(request, "user_id", None)
-        if not student_id:
-            return error("Authentication required.", "UNAUTHORIZED",
-                         http_status=status.HTTP_401_UNAUTHORIZED)
+        serializer = ApplicationCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
 
-        project_id = request.data.get("project_id")
-
-        # Validate project exists and is PUBLISHED
-        auth_header = request.headers.get("Authorization", "")
-        try:
-            project = get_project(project_id, auth_header)
-        except ProjectServiceError as e:
-            return error(e.message, e.code, http_status=e.http_status)
-
+        project = get_project(data["project_id"], auth_header(request))
         if project.get("status") != "PUBLISHED":
-            return error(
-                "Project is not accepting applications.",
-                "PROJECT_NOT_PUBLISHED",
-                http_status=status.HTTP_400_BAD_REQUEST,
+            raise ApiError(
+                "This project is not accepting applications.",
+                "INVALID_STATE_TRANSITION",
             )
 
-        if Application.objects.filter(
-            student_id=student_id, project_id=project_id
-        ).exists():
-            return error(
-                "Student has already applied to this project.",
-                "DUPLICATE_APPLICATION",
-                http_status=status.HTTP_409_CONFLICT,
-            )
-
-        data = request.data.copy()
-        data["student_id"] = student_id
-        serializer = ApplicationCreateSerializer(data=data)
-        if not serializer.is_valid():
-            return error(
-                "Validation failed.",
-                "VALIDATION_ERROR",
-                details={"fields": serializer.errors},
-            )
-
-        try:
-            application = create_application(
-                student_id=serializer.validated_data["student_id"],
-                project_id=serializer.validated_data["project_id"],
-                proposal=serializer.validated_data["proposal"],
-                resume_url=serializer.validated_data.get("resume_url", ""),
-            )
-        except DuplicateApplicationError:
-            return error(
-                "Student has already applied to this project.",
-                "DUPLICATE_APPLICATION",
-                http_status=status.HTTP_409_CONFLICT,
-            )
+        application = services.create_application(
+            student_id=request.user.id,
+            project_id=data["project_id"],
+            proposal=data["proposal"],
+            resume_url=data.get("resume_url", ""),
+        )
 
         return success(
-            ApplicationCreateSerializer(application).data,
-            "Application submitted successfully.",
-            http_status=status.HTTP_201_CREATED,
+            ApplicationSerializer(application).data,
+            "Application submitted successfully",
+            status.HTTP_201_CREATED,
         )
 
 
 class ApplicationDetailView(APIView):
     def get(self, request, pk):
-        application = get_application_by_id(pk)
-        return success(ApplicationListSerializer(application).data, "Application retrieved.")
+        application = get_application_for_reader(request, pk)
+        return success(
+            ApplicationSerializer(application).data,
+            "Application retrieved successfully",
+        )
+
+    def _update(self, request, pk, partial):
+        application = get_application_for_applicant(request, pk)
+        serializer = ApplicationUpdateSerializer(
+            application, data=request.data, partial=partial
+        )
+        serializer.is_valid(raise_exception=True)
+        updated = services.update_application(
+            application, **serializer.validated_data
+        )
+        return success(
+            ApplicationSerializer(updated).data,
+            "Application updated successfully",
+        )
 
     def put(self, request, pk):
-        require_role(request, "STUDENT")
-        application = get_application_by_id(pk)
-        serializer = ApplicationUpdateSerializer(application, data=request.data)
-        if not serializer.is_valid():
-            return error("Validation failed.", "VALIDATION_ERROR",
-                         details={"fields": serializer.errors})
-        updated = update_application(
-            application_id=pk,
-            proposal=serializer.validated_data.get("proposal"),
-            resume_url=serializer.validated_data.get("resume_url"),
-        )
-        return success(ApplicationListSerializer(updated).data, "Application updated.")
+        return self._update(request, pk, partial=False)
+
+    def patch(self, request, pk):
+        return self._update(request, pk, partial=True)
 
 
 class ApplicationShortlistView(APIView):
     def post(self, request, pk):
-        require_role(request, "CLIENT", "ADMIN")
-        try:
-            application = shortlist_application(pk)
-        except ValueError as e:
-            return error(str(e), "INVALID_STATE_TRANSITION")
-        return success(ApplicationListSerializer(application).data, "Application shortlisted.")
+        application = get_application_for_owner_client(request, pk)
+        application = services.shortlist_application(application)
+        return success(
+            ApplicationSerializer(application).data,
+            "Application shortlisted successfully",
+        )
 
 
 class ApplicationSelectView(APIView):
     def post(self, request, pk):
-        require_role(request, "CLIENT", "ADMIN")
+        application = get_object_or_404(Application, id=pk)
+        project = verify_project_owner(request, application.project_id)
 
-        # Fetch project to get client_id and verify ownership
-        application = get_application_by_id(pk)
-        auth_header = request.headers.get("Authorization", "")
-        try:
-            project = get_project(str(application.project_id), auth_header)
-        except ProjectServiceError as e:
-            return error(e.message, e.code, http_status=e.http_status)
-
-        # Verify caller owns the project
-        caller_id = str(getattr(request, "user_id", ""))
-        if str(project.get("client_id")) != caller_id:
-            return error(
-                "You do not own this project.",
-                "FORBIDDEN",
-                http_status=status.HTTP_403_FORBIDDEN,
+        if project.get("status") not in {"PUBLISHED", "IN_PROGRESS"}:
+            raise ApiError(
+                "Applicants can only be selected for a published project.",
+                "INVALID_STATE_TRANSITION",
             )
 
-        client_id = project.get("client_id")
+        application, assignment = services.select_application(
+            application,
+            client_id=request.user.id,
+            on_assigned=lambda _: start_project(
+                application.project_id, auth_header(request)
+            ),
+        )
 
-        try:
-            application, assignment = select_application(pk, client_id=client_id)
-        except ValueError as e:
-            return error(str(e), "INVALID_STATE_TRANSITION")
-
-        update_project_status(str(application.project_id), "IN_PROGRESS", auth_header)
         return success(
             {
-                "application": ApplicationListSerializer(application).data,
+                "application": ApplicationSerializer(application).data,
                 "assignment": AssignmentSerializer(assignment).data,
             },
-            "Applicant selected and assignment created.",
-            http_status=status.HTTP_201_CREATED,
+            "Applicant selected and assignment created",
+            status.HTTP_201_CREATED,
         )
 
 
 class ApplicationRejectView(APIView):
     def post(self, request, pk):
-        require_role(request, "CLIENT", "ADMIN")
-        try:
-            application = reject_application(pk)
-        except ValueError as e:
-            return error(str(e), "INVALID_STATE_TRANSITION")
-        return success(ApplicationListSerializer(application).data, "Application rejected.")
+        application = get_application_for_owner_client(request, pk)
+        application = services.reject_application(application)
+        return success(
+            ApplicationSerializer(application).data,
+            "Application rejected successfully",
+        )
 
 
 class ApplicationWithdrawView(APIView):
     def post(self, request, pk):
-        require_role(request, "STUDENT")
-        try:
-            application = withdraw_application(pk)
-        except ValueError as e:
-            return error(str(e), "INVALID_STATE_TRANSITION")
-        return success(ApplicationListSerializer(application).data, "Application withdrawn.")
+        application = get_application_for_applicant(request, pk)
+        application = services.withdraw_application(application)
+        return success(
+            ApplicationSerializer(application).data,
+            "Application withdrawn successfully",
+        )
 
 
 class AssignmentListView(APIView):
     def get(self, request):
-        project_id = request.query_params.get("project_id")
+        qs = visible_assignments(request.user)
 
+        project_id = uuid_param(request, "project_id")
         if project_id:
-            qs = get_assignments_for_project(project_id)
-        else:
-            qs = get_all_assignments()
+            qs = qs.filter(project_id=project_id)
 
-        data, err = paginate(qs, AssignmentSerializer, request)
-        if err:
-            return err
-        return Response(data, status=status.HTTP_200_OK)
+        assignment_status = request.query_params.get("status")
+        if assignment_status:
+            qs = qs.filter(status=assignment_status)
+
+        return paginated(
+            qs.order_by("-assigned_date", "id"),
+            AssignmentSerializer,
+            request.query_params,
+            "Assignments retrieved successfully",
+        )
 
 
 class AssignmentDetailView(APIView):
     def get(self, request, pk):
-        assignment = get_assignment_by_id(pk)
-        return success(AssignmentSerializer(assignment).data, "Assignment retrieved.")
-
-    def patch(self, request, pk):
-        require_role(request, "CLIENT", "ADMIN")
-        assignment = get_assignment_by_id(pk)
-        new_status = request.data.get("status")
-        allowed = ["active", "completed"]
-        if new_status not in allowed:
-            return error(
-                f"Invalid status '{new_status}'. Allowed: {', '.join(allowed)}.",
-                "VALIDATION_ERROR",
-                details={"fields": {"status": f"Must be one of: {', '.join(allowed)}"}},
-            )
-        assignment.status = new_status
-        assignment.save()
-        return success(AssignmentSerializer(assignment).data, "Assignment updated.")
+        assignment = get_object_or_404(visible_assignments(request.user), id=pk)
+        return success(
+            AssignmentSerializer(assignment).data,
+            "Assignment retrieved successfully",
+        )
 
 
+class AssignmentCompleteView(APIView):
+    def post(self, request, pk):
+        require_role(request, "CLIENT")
+        assignment = get_object_or_404(
+            Assignment.objects.filter(client_id=request.user.id), id=pk
+        )
+        assignment = services.complete_assignment(assignment)
+        return success(
+            AssignmentSerializer(assignment).data,
+            "Assignment completed successfully",
+        )

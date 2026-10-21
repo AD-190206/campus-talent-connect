@@ -1,3 +1,5 @@
+import hashlib
+import uuid
 from django.contrib.auth.models import AbstractBaseUser, PermissionsMixin, BaseUserManager
 from django.db import models
 
@@ -20,6 +22,11 @@ class UserManager(BaseUserManager):
 
 
 class User(AbstractBaseUser, PermissionsMixin):
+    public_id = models.UUIDField(
+    default=uuid.uuid4,
+    unique=True,
+    editable=False,
+)
     ROLE_CHOICES = [
         ("STUDENT", "Student"),
         ("CLIENT", "Client"),
@@ -62,3 +69,29 @@ class ClientProfile(models.Model):
     company_name = models.CharField(max_length=255, blank=True)
     contact_person = models.CharField(max_length=255)
     phone = models.CharField(max_length=20, blank=True)
+
+
+class RefreshToken(models.Model):
+    user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name="refresh_tokens",
+    )
+    token_hash = models.CharField(max_length=64, unique=True)
+    expires_at = models.DateTimeField()
+    revoked_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    @staticmethod
+    def hash_token(token):
+        return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    @property
+    def is_valid(self):
+        from django.utils import timezone
+
+        return (
+            self.revoked_at is None
+            and self.expires_at > timezone.now()
+            and self.user.is_active
+        )

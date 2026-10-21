@@ -7,8 +7,28 @@ from django.db import IntegrityError, transaction
 from .models import Payment, Notification
 
 
+# Only a mock provider exists in this iteration (contract decision 9). Every
+# payment response reports this so it is never mistaken for a live gateway.
+PAYMENT_PROVIDER = "MOCK"
+
+# Payments in these statuses no longer block a new payment for the assignment.
+INACTIVE_STATUSES = (Payment.Status.FAILED, Payment.Status.REFUNDED)
+
+
 class PaymentServiceError(Exception):
     pass
+
+
+class DuplicateAssignmentPayment(PaymentServiceError):
+    """An active payment already exists for the assignment."""
+
+    def __init__(self, payment):
+        super().__init__("An active payment already exists for this assignment.")
+        self.payment = payment
+
+
+class MockPaymentsDisabled(PaymentServiceError):
+    """Processing was requested while the mock provider is switched off."""
 
 
 def create_payment(validated_data):
@@ -48,6 +68,14 @@ def create_payment(validated_data):
             "This idempotency key was already used with different payment details."
         )
 
+    active = (
+        Payment.objects.filter(assignment_id=validated_data["assignment_id"])
+        .exclude(status__in=INACTIVE_STATUSES)
+        .first()
+    )
+    if active:
+        raise DuplicateAssignmentPayment(active)
+
     try:
         with transaction.atomic():
             payment = Payment.objects.create(
@@ -73,7 +101,7 @@ def process_payment(payment, simulate_failure=False):
     Update payment status and create notifications atomically.
     """
     if not settings.MOCK_PAYMENT_ENABLED:
-        raise PaymentServiceError(
+        raise MockPaymentsDisabled(
             "Mock payment processing is disabled. "
             "Configure a real payment gateway or explicitly enable "
             "mock payments for development."
@@ -139,5 +167,21 @@ def release_payment(payment):
 
         payment.status = Payment.Status.RELEASED
         payment.save(update_fields=["status", "updated_at"])
+
+        Notification.objects.create(
+            user_id=payment.payee_id,
+            type=Notification.NotificationType.IN_APP,
+            event="PAYMENT_RELEASED",
+            message=(
+                f"Payment {payment.id} of {payment.amount - payment.fee} "
+                f"has been released to you."
+            ),
+        )
+        Notification.objects.create(
+            user_id=payment.payer_id,
+            type=Notification.NotificationType.IN_APP,
+            event="PAYMENT_RELEASED",
+            message=f"Payment {payment.id} has been released to the student.",
+        )
 
         return payment

@@ -1,4 +1,4 @@
-﻿import os
+import os
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -64,7 +64,8 @@ DATABASES = {
 AUTH_PASSWORD_VALIDATORS = []
 
 LANGUAGE_CODE = "en-us"
-TIME_ZONE = "Asia/Kolkata"
+# UTC so timestamps are returned as ISO 8601 ending in "Z".
+TIME_ZONE = "UTC"
 USE_I18N = True
 USE_TZ = True
 
@@ -81,6 +82,9 @@ REST_FRAMEWORK = {
     ],
     "DEFAULT_PERMISSION_CLASSES": [
         "rest_framework.permissions.IsAuthenticated",
+    ],
+    "DEFAULT_RENDERER_CLASSES": [
+        "rest_framework.renderers.JSONRenderer",
     ],
     "EXCEPTION_HANDLER": "work_review.exceptions.custom_exception_handler",
     "DEFAULT_PAGINATION_CLASS": "work_review.pagination.ContractPagination",

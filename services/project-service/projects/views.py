@@ -197,6 +197,46 @@ class PublishProjectView(APIView):
         )
 
 
+class StartProjectView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, project_id):
+        if not is_client(request.user):
+            raise PermissionDenied("Only the owning client can start a project.")
+
+        project = get_visible_project(request.user, project_id)
+
+        project = services.start_project(
+            project=project, client_id=get_client_id(request.user)
+        )
+
+        return success(
+            ProjectSerializer(project).data,
+            "Project started successfully",
+        )
+
+
+class CompleteProjectView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, project_id):
+        if not is_client(request.user):
+            raise PermissionDenied(
+                "Only the owning client can complete a project."
+            )
+
+        project = get_visible_project(request.user, project_id)
+
+        project = services.complete_project(
+            project=project, client_id=get_client_id(request.user)
+        )
+
+        return success(
+            ProjectSerializer(project).data,
+            "Project completed successfully",
+        )
+
+
 class CloseProjectView(APIView):
     permission_classes = [IsAuthenticated]
 

@@ -1,13 +1,43 @@
 
+import logging
+
+from django.http import JsonResponse
+from rest_framework.response import Response
 from rest_framework.views import exception_handler
+
+logger = logging.getLogger(__name__)
+
+
+def _error_body(message, code):
+    return {"error": message, "code": code, "details": {}}
+
+
+def json_404(request, exception=None):
+    return JsonResponse(
+        _error_body("The requested resource was not found.", "NOT_FOUND"),
+        status=404,
+    )
+
+
+def json_500(request):
+    return JsonResponse(
+        _error_body("An unexpected error occurred.", "INTERNAL_SERVER_ERROR"),
+        status=500,
+    )
 
 
 def custom_exception_handler(exc, context):
     response = exception_handler(exc, context)
 
-    # Let Django handle unexpected server errors normally.
+    # Unexpected errors still use the envelope, without internal details.
     if response is None:
-        return None
+        logger.error("Unhandled exception", exc_info=exc)
+        return Response(
+            _error_body(
+                "An unexpected error occurred.", "INTERNAL_SERVER_ERROR"
+            ),
+            status=500,
+        )
 
     original_data = response.data
     details = {}
